@@ -14,14 +14,12 @@ Env vars:
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
-import time
 from collections import namedtuple
 from pathlib import Path
 from typing import Callable
@@ -903,7 +901,7 @@ If FAIL, each bullet: <Category>: <Problem>. Fix: <Action>."""
 
 
 def build_precompact_prompt(transcript_content: str, cwd: str = "") -> str:
-    truncated = _matryoshka_compact(transcript_content, cwd=cwd)
+    truncated = _matryoshka_compact(_redact(transcript_content), cwd=cwd)
     return (
         f"""You are a metacognition layer reflecting on agent session quality before compaction.
 The following is the tail of the conversation transcript.
@@ -1022,92 +1020,6 @@ _VERDICT_PREFIX: dict[str, str] = {
     "UNCERTAIN": "? UNCERTAIN",
 }
 
-
-# ---------------------------------------------------------------------------
-# Content-hash dedup cache (avoids re-reviewing identical edits)
-# ---------------------------------------------------------------------------
-
-_DEDUP_TTL = 300  # seconds — re-review after this
-_DEDUP_MAX = 100  # max cache entries per session
-
-
-def _dedup_path(session_id: str) -> Path:
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
-    return STATE_DIR / f"codex-reflector-dedup-{safe}.json"
-
-
-def _review_hash(tool_name: str, tool_input: dict) -> str:
-    """Compute content hash for dedup. Stable across invocations."""
-    file_path = tool_input.get("file_path", tool_input.get("path", ""))
-    content = tool_input.get("content", "")
-    old = tool_input.get("old_string", "")
-    new = tool_input.get("new_string", "")
-    key = f"{tool_name}|{file_path}|{content}|{old}|{new}"
-    return hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:16]
-
-
-def _check_dedup(session_id: str, content_hash: str) -> str | None:
-    """Return cached verdict if hash was reviewed recently, else None."""
-    if not session_id:
-        return None
-    path = _dedup_path(session_id)
-    if not path.exists():
-        return None
-    try:
-        with open(path, "r") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                data = json.load(f)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        entry = data.get("hashes", {}).get(content_hash)
-        if entry and (time.time() - entry.get("ts", 0)) < _DEDUP_TTL:
-            return entry.get("verdict")
-    except (json.JSONDecodeError, OSError, KeyError):
-        pass
-    return None
-
-
-def _record_dedup(
-    session_id: str, content_hash: str, verdict: str, file_path: str
-) -> None:
-    """Record a review hash+verdict in the dedup cache."""
-    if not session_id:
-        return
-    path = _dedup_path(session_id)
-    if not path.exists():
-        path.touch(mode=0o600)
-    try:
-        with open(path, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                try:
-                    data = json.load(f)
-                except (json.JSONDecodeError, ValueError):
-                    data = {"hashes": {}}
-                hashes = data.get("hashes", {})
-                # Evict expired + enforce max
-                now = time.time()
-                hashes = {
-                    k: v for k, v in hashes.items() if now - v.get("ts", 0) < _DEDUP_TTL
-                }
-                if len(hashes) >= _DEDUP_MAX:
-                    oldest_key = min(hashes, key=lambda k: hashes[k].get("ts", 0))
-                    del hashes[oldest_key]
-                hashes[content_hash] = {
-                    "verdict": verdict,
-                    "ts": now,
-                    "file": file_path,
-                }
-                data["hashes"] = hashes
-                f.seek(0)
-                f.truncate()
-                json.dump(data, f)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-    except OSError:
-        pass  # fail-open
 
 
 # ---------------------------------------------------------------------------
@@ -1421,56 +1333,6 @@ def run_self_test() -> None:
         if ok:
             all_passed += 1
 
-    # --- Review hash dedup tests ---
-    print("\n=== Review Hash Dedup ===")
-    base_input = {"file_path": "a.py", "old_string": "x", "new_string": "y"}
-    hash_cases = [
-        # (tool_name, tool_input, should_equal_base, description)
-        ("Edit", base_input, True, "identical input"),
-        (
-            "Edit",
-            {"file_path": "a.py", "old_string": "x", "new_string": "y"},
-            True,
-            "same values different dict",
-        ),
-        (
-            "Edit",
-            {"file_path": "b.py", "old_string": "x", "new_string": "y"},
-            False,
-            "different file_path",
-        ),
-        (
-            "Write",
-            {"file_path": "a.py", "content": "z"},
-            False,
-            "different tool + content",
-        ),
-        (
-            "Edit",
-            {"file_path": "a.py", "old_string": "x", "new_string": "z"},
-            False,
-            "different new_string",
-        ),
-        (
-            "Edit",
-            {"path": "c.py", "old_string": "x", "new_string": "y"},
-            False,
-            "path vs file_path key",
-        ),
-    ]
-    base_hash = _review_hash("Edit", base_input)
-    for tool_name, tool_input, should_eq, desc in hash_cases:
-        h = _review_hash(tool_name, tool_input)
-        matches = h == base_hash
-        ok = matches == should_eq
-        status = "OK" if ok else "MISMATCH"
-        print(
-            f"  {status}: _review_hash ({desc}) eq_base={matches} (expected {should_eq})"
-        )
-        all_total += 1
-        if ok:
-            all_passed += 1
-
     # --- Synthetic path tests ---
     print("\n=== Synthetic Path Guards ===")
     synth_cases = [
@@ -1569,47 +1431,13 @@ def main() -> None:
         tool_response = hook_data.get("tool_response", {})
 
         if category == "code_change":
-            # Dedup: skip Codex if identical content was reviewed recently
-            content_hash = _review_hash(tool_name, tool_input)
-            cached_verdict = _check_dedup(session_id, content_hash)
-            if cached_verdict:
-                file_path = tool_input.get(
-                    "file_path", tool_input.get("path", "unknown")
-                )
-                debug(f"dedup hit: {content_hash} → {cached_verdict} [{file_path}]")
-                # Mirror fail-state bookkeeping so Stop sees correct state
-                if cached_verdict in ("FAIL", "UNCERTAIN"):
-                    write_fail_state(
-                        session_id,
-                        tool_name,
-                        file_path,
-                        f"(cached {cached_verdict})",
-                    )
-                elif cached_verdict == "PASS":
-                    clear_fail_state(session_id, file_path)
-                    sys.exit(0)  # already reviewed and passed — skip silently
-                # FAIL/UNCERTAIN: re-surface cached verdict without re-invoking Codex
-                prefix = _VERDICT_PREFIX[cached_verdict]
-                result = {
-                    "systemMessage": (
-                        f"Codex Reflector {prefix} [{file_path}]:"
-                        " (cached — same content reviewed recently)"
-                    ),
-                }
-            else:
-                prompt = build_code_review_prompt(
-                    tool_name, tool_input, cwd=cwd, tool_response=tool_response
-                )
-                raw = invoke_codex(prompt, cwd, effort, model)
-                result = respond_code_review(
-                    session_id, tool_name, tool_input, raw, cwd=cwd, event_name=event
-                )
-                # Record for future dedup
-                verdict = parse_verdict(raw) if raw else "UNCERTAIN"
-                file_path = tool_input.get(
-                    "file_path", tool_input.get("path", "unknown")
-                )
-                _record_dedup(session_id, content_hash, verdict, file_path)
+            prompt = build_code_review_prompt(
+                tool_name, tool_input, cwd=cwd, tool_response=tool_response
+            )
+            raw = invoke_codex(prompt, cwd, effort, model)
+            result = respond_code_review(
+                session_id, tool_name, tool_input, raw, cwd=cwd, event_name=event
+            )
         elif category == "plan_review":
             plan = _find_plan_for_session(hook_data)
             if plan is None:
