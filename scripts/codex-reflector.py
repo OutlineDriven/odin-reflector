@@ -38,7 +38,7 @@ _SYNTHETIC_PREFIX = (
 )
 DEFAULT_MODEL = "gpt-5.4"  # 1M context window
 LIGHTNING_FAST_MODEL = "gpt-5.3-codex-spark"  # 128k context window
-FAST_MODEL = "gpt-5.1-codex-mini"  # 400k context window
+FAST_MODEL = "gpt-5.4-mini"  # 1M context window
 
 # ---------------------------------------------------------------------------
 # Model/effort presets — every (model, effort) pair lives here
@@ -46,21 +46,21 @@ FAST_MODEL = "gpt-5.1-codex-mini"  # 400k context window
 
 ModelEffort = namedtuple("ModelEffort", ["model", "effort"])
 
-_ME_CODE_REVIEW = ModelEffort(DEFAULT_MODEL, "low")  # base: simple changes
+_ME_CODE_REVIEW = ModelEffort(FAST_MODEL, "medium")  # base: simple changes → mini
 _ME_CODE_REVIEW_HARD = ModelEffort(
     DEFAULT_MODEL, "medium"
-)  # security/test/data file, large, or significant change
+)  # risk signals → full model
 _ME_CODE_REVIEW_COMPLEX = ModelEffort(
     DEFAULT_MODEL, "high"
-)  # multiple complexity signals
-_ME_CODE_REVIEW_TINY = ModelEffort(DEFAULT_MODEL, "low")  # trivial: old+new < 200 chars
-_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")
-_ME_THINKING = ModelEffort(DEFAULT_MODEL, "medium")
-_ME_BASH_FAILURE = ModelEffort(FAST_MODEL, "high")
-_ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")
-_ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "medium")
-_ME_SUMMARIZE = ModelEffort(FAST_MODEL, "high")  # _compact_output + _matryoshka_compact
-_ME_SUBAGENT_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # commented-out SubagentStop
+)  # multiple signals → full+high
+_ME_CODE_REVIEW_TINY = ModelEffort(FAST_MODEL, "medium")  # trivial → mini+low
+_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")  # always full
+_ME_THINKING = ModelEffort(FAST_MODEL, "xhigh")  # thinking → mini
+_ME_BASH_FAILURE = ModelEffort(FAST_MODEL, "low")
+_ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # always full (safety)
+_ME_PRECOMPACT = ModelEffort(FAST_MODEL, "high")  # compaction → mini
+_ME_SUMMARIZE = ModelEffort(FAST_MODEL, "medium")  # _compact_output + _matryoshka_compact
+_ME_SUBAGENT_REVIEW = ModelEffort(FAST_MODEL, "medium")  # always full model
 
 # Compact output directives — verdict vs non-verdict prompts.
 _COMPACT_VERDICT = """
@@ -386,9 +386,9 @@ def _gate_model_effort(
     if file_hints or change_hints or size > 5000:
         return _ME_CODE_REVIEW_HARD
 
-    # Medium-sized, no signals → bump effort
+    # Medium-sized, no signals → mini with bumped effort
     if size > 1000:
-        return ModelEffort(model, "high")
+        return ModelEffort(FAST_MODEL, "high")
 
     # Default base
     return model, effort
@@ -546,9 +546,7 @@ def invoke_codex(prompt: str, cwd: str, effort: str = "medium", model: str = "")
     """Call `codex exec` in read-only sandbox. Returns raw output or ''."""
     # Env var override takes precedence, then passed model, then DEFAULT_MODEL
     model = os.environ.get("CODEX_REFLECTOR_MODEL", model or DEFAULT_MODEL)
-    # Fast model always uses high effort
-    if model == FAST_MODEL:
-        effort = "high"
+    # Lightning-fast model needs at least high effort
     if model == LIGHTNING_FAST_MODEL and effort in ("low", "medium"):
         effort = "high"
 

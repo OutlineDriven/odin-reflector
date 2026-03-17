@@ -103,7 +103,7 @@ In `respond_code_review()`, `respond_plan_review()`, and `respond_subagent_revie
 
 - **Verdict window**: `parse_verdict()` scans first 5 lines only. Buried verdicts → UNCERTAIN. Prompts must put PASS/FAIL on first line.
 - **Model override precedence**: `CODEX_REFLECTOR_MODEL` env var overrides ALL model selections including adaptive gating.
-- **Fast model effort floor**: FAST_MODEL forces effort to exactly "high" (overrides even "xhigh"). LIGHTNING_FAST auto-bumps effort to at least "high" (preserves "xhigh").
+- **Fast model effort**: FAST_MODEL (gpt-5.4-mini) has no effort floor — presets control effort directly. LIGHTNING_FAST auto-bumps effort to at least "high" (preserves "xhigh").
 - **Plan path silent rejection**: `_validate_plan_path()` returns None with no error (DEBUG-only). Rejection of one candidate does not prevent review — the 4-level fallback chain may still find a different plan.
 - **Matryoshka recursion**: up to 3 layers, each calls `invoke_codex()` (100s timeout). Worst case: 300s for one compaction.
 - **Stop loop prevention**: `stop_hook_active` flag check at entry. Commented-out SubagentStop block needs same guard if re-enabled.
