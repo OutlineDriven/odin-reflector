@@ -27,6 +27,25 @@
         "second-opinion",
         "hooks"
       ]
+    },
+    {
+      "name": "claude-reviewer",
+      "source": "./plugins/claude-reviewer",
+      "version": "0.1.0",
+      "description": "Claude Code reviewer hook — runs claude -p as a post-tool reviewer with haiku→sonnet cost ladder",
+      "author": {
+        "name": "cognitive-glitch"
+      },
+      "tags": [
+        "claude",
+        "reviewer",
+        "code-review",
+        "metacognition",
+        "second-opinion",
+        "hooks",
+        "haiku",
+        "sonnet"
+      ]
     }
   ],
   "metadata": {

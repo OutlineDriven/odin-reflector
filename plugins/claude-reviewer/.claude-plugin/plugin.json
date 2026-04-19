@@ -1,0 +1,6 @@
+{
+  "name": "claude-reviewer",
+  "version": "0.1.0",
+  "description": "Claude Code reviewer hook — runs claude -p as a post-tool reviewer with haiku→sonnet cost ladder",
+  "hooks": "./hooks/hooks.json"
+}

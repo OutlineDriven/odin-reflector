@@ -1,0 +1,50 @@
+{
+  "description": "Claude reviewer: routes hook events to claude -p for second-model review",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Patch|NotebookEdit|ExitPlanMode|mcp__.*morph.*|mcp__.*sequentialthinking.*|mcp__.*sequential_thinking.*|mcp__.*actor-critic.*|mcp__.*shannon.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude-reviewer.py\"",
+            "timeout": 240
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude-reviewer.py\"",
+            "timeout": 240
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude-reviewer.py\"",
+            "timeout": 240
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/claude-reviewer.py\"",
+            "timeout": 240
+          }
+        ]
+      }
+    ]
+  }
+}
