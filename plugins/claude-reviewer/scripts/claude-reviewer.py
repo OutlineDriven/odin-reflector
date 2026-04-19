@@ -242,18 +242,15 @@ def _compact_output(text: str, cwd: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _gate_model_effort(
-    category: str, model: str, tool_input: dict, num_files: int = 1
-) -> str:
-    """Adaptive model selection based on complexity signals.
+# origin: codex-reflector@2bb0b32
+def _gate_model_effort(category: str, model: str, tool_input: dict) -> str:
+    """Pre-call model selection based on per-tool complexity signals.
 
-    PostToolUse: UNCERTAIN + files>3 → escalate to sonnet
-    PostToolUseFailure/bash_failure: always starts at base; escalate on UNCERTAIN after response
-    Stop: starts at sonnet; escalate to opus on pending FAILs
-    PreCompact: starts at haiku; escalate to sonnet on transcript>200K chars
+    Escalates one rung up the cost ladder when the tool input triggers a
+    risk signal: security-sensitive file path or large content (>5 000 chars).
+    Only applies to code_change category; all other categories pass through.
     Returns the (possibly escalated) model string.
     """
-    # origin: codex-reflector@2bb0b32
     if category != "code_change":
         return model
 
@@ -261,18 +258,17 @@ def _gate_model_effort(
     content = tool_input.get("content", "")
     new = tool_input.get("new_string", "")
 
-    # Count risk signals
+    # Risk signals
     security_sensitive = any(
         x in file_path.lower()
         for x in (".env", "secret", "credential", "key", "token", "password", "auth")
     )
     large = len(content or new or "") > 5000
-    multi_file = num_files > 3
 
-    if security_sensitive or large or multi_file:
+    if security_sensitive or large:
         next_model = escalate(model, LADDER)
         if next_model:
-            debug(f"escalating {model} -> {next_model} (signals: sec={security_sensitive} large={large} multi={multi_file})")
+            debug(f"escalating {model} -> {next_model} (signals: sec={security_sensitive} large={large})")
             return next_model
 
     return model
@@ -867,7 +863,9 @@ def respond_stop(hook_data: dict, cwd: str) -> dict | None:
 
     session_id = hook_data.get("session_id", "")
 
-    # Fast path: pending FAIL states (no claude invocation needed)
+    # Fast path: pending FAIL states — block immediately, no transcript review needed.
+    # Early return here is intentional: if prior FAILs are unresolved there is no value
+    # in re-running the transcript review; the agent must fix the flagged issues first.
     fails = _read_state(session_id)
     if fails:
         reason = f"Unresolved Claude Reviewer FAIL reviews:\n{format_fails(fails)}"
@@ -886,12 +884,7 @@ def respond_stop(hook_data: dict, cwd: str) -> dict | None:
         debug("no transcript available, approving stop")
         return None  # fail-open
 
-    # Escalate to opus if there are pending fails (already caught above, but for extended logic)
     stop_model = _MODEL_STOP  # sonnet by default
-    if fails:
-        opus = escalate(stop_model, LADDER)
-        if opus:
-            stop_model = opus
 
     prompt = build_stop_review_prompt(transcript, cwd=cwd)
     raw_output = invoke_claude(prompt, model=stop_model)
