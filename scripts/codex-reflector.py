@@ -36,7 +36,7 @@ STATE_DIR = Path("/tmp")
 _SYNTHETIC_PREFIX = (
     "synthetic::"  # Readability convention for non-filesystem path identifiers
 )
-DEFAULT_MODEL = "gpt-5.4"  # 1M context window
+DEFAULT_MODEL = "gpt-5.5"  # 1M context window
 LIGHTNING_FAST_MODEL = "gpt-5.3-codex-spark"  # 128k context window
 FAST_MODEL = "gpt-5.4-mini"  # 1M context window
 
