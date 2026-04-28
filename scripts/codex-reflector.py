@@ -50,11 +50,11 @@ _ME_CODE_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # base: generic changes
 _ME_CODE_REVIEW_HARD = ModelEffort(DEFAULT_MODEL, "high")  # risk signals
 _ME_CODE_REVIEW_COMPLEX = ModelEffort(DEFAULT_MODEL, "xhigh")
 _ME_CODE_REVIEW_TINY = ModelEffort(DEFAULT_MODEL, "low")  # trivial → low
-_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "high")
-_ME_THINKING = ModelEffort(DEFAULT_MODEL, "high")
+_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")
+_ME_THINKING = ModelEffort(DEFAULT_MODEL, "xhigh")
 _ME_BASH_FAILURE = ModelEffort(DEFAULT_MODEL, "low")
-_ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # always full (safety)
-_ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "medium")  # compaction
+_ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "high")
+_ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "high")  # compaction
 _ME_SUMMARIZE = ModelEffort(FAST_MODEL, "high")
 _ME_SUBAGENT_REVIEW = ModelEffort(FAST_MODEL, "high")
 
