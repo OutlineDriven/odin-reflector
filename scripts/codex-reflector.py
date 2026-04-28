@@ -300,7 +300,7 @@ _SKIP_TOOLS: frozenset[str] = frozenset(
 )
 
 # MCP substrings for code-editing tools
-_MCP_EDIT_MARKERS: tuple[str, ...] = ("morph-mcp", "mcp__morph", "mcp__edit")
+_MCP_EDIT_MARKERS: tuple[str, ...] = ("morph-mcp", "mcp__morph", "mcp__edit__edit_file")
 
 # MCP substrings for thinking/metacognition tools
 _MCP_THINKING_MARKERS: tuple[str, ...] = (
