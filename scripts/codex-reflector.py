@@ -665,9 +665,9 @@ def build_code_review_prompt(
         instruction = tool_input.get("instruction", "")
         if code_edit and instruction and _is_safe_edit_path(file_path, cwd):
             try:
-                applied = Path(file_path).read_text(
-                    encoding="utf-8", errors="replace"
-                )[:50_000]
+                applied = Path(file_path).read_text(encoding="utf-8", errors="replace")[
+                    :50_000
+                ]
                 fast_apply_snippet = _matryoshka_compact(
                     f"Instruction: {_redact(instruction)}\n\n"
                     f"--- sketch ---\n{_redact(code_edit)}\n\n"
