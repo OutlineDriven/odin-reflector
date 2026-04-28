@@ -351,15 +351,35 @@ _CATEGORY_DEFAULTS: dict[str, ModelEffort] = {
     "plan_review": _ME_PLAN_REVIEW,
     "thinking": _ME_THINKING,
     "bash_failure": _ME_BASH_FAILURE,
+    "code_change_failure": _ME_BASH_FAILURE,
 }
 
 
-def classify(tool_name: str, hook_event: str) -> tuple[str, str, str] | None:
-    """Route tool call → (category, model, effort) or None to skip."""
+def classify(
+    tool_name: str, hook_event: str, tool_input: dict | None = None
+) -> tuple[str, str, str] | None:
+    """Route tool call → (category, model, effort) or None to skip.
+
+    `tool_input` is consulted only for PostToolUseFailure routing of Fast
+    Apply tools — name match alone could misclassify a non-Morph
+    `__edit_file` MCP, so we require the Morph payload shape (code_edit +
+    instruction) before routing to code_change_failure.
+    """
     if hook_event == "PostToolUseFailure":
         if tool_name == "Bash":
             model, effort = _CATEGORY_DEFAULTS["bash_failure"]
             return ("bash_failure", model, effort)
+        # Diagnostic-only review for Fast Apply failures — response path
+        # intentionally skips FAIL caching so an aborted edit doesn't
+        # leave a stale Stop-blocker behind.
+        if (
+            _is_fast_apply(tool_name)
+            and tool_input is not None
+            and tool_input.get("code_edit")
+            and tool_input.get("instruction")
+        ):
+            model, effort = _CATEGORY_DEFAULTS["code_change_failure"]
+            return ("code_change_failure", model, effort)
         return None
 
     # Exact match → category → MCP fallback → skip
@@ -840,6 +860,57 @@ Analyze:
 3. COMMAND ASSUMPTIONS: What assumption was false
 4. ALTERNATIVE APPROACHES: How to avoid the failure entirely
 5. PREVENTION: Workflow changes to prevent recurrence
+
+Be concise and actionable."""
+        + _COMPACT_ANALYSIS
+    )
+
+
+def build_code_change_failure_prompt(
+    tool_name: str,
+    tool_input: dict,
+    error: str,
+    tool_response: dict | str | None = None,
+    cwd: str = "",
+) -> str:
+    """Diagnostic prompt for a failed Fast Apply edit (Morph etc.).
+
+    Mirrors `build_bash_failure_prompt` shape — diagnostic, not a verdict.
+    Caller (main dispatch) reuses `respond_bash_failure` for the response
+    so no FAIL state is cached (the failed edit may not have touched the
+    file at all; a cached FAIL would create a stale Stop-blocker).
+    """
+    file_path = tool_input.get("path", tool_input.get("file_path", "unknown"))
+    code_edit = tool_input.get("code_edit", "")
+    instruction = tool_input.get("instruction", "")
+
+    response_info = ""
+    if isinstance(tool_response, dict):
+        resp_error = tool_response.get("error", "")
+        if resp_error:
+            response_info += f"\nTool error: {_redact(str(resp_error)[:1500])}"
+    elif isinstance(tool_response, str) and tool_response.strip():
+        response_info = f"\nTool output: {_redact(tool_response.strip()[:1500])}"
+
+    sandboxed = _sandbox_content(
+        "fast-apply-failure",
+        f"Instruction: {_redact(instruction)}\n\n"
+        f"--- sketch ---\n{_redact(code_edit)[:2000]}",
+    )
+
+    return (
+        f"""A Fast Apply edit failed. Perform structured root cause analysis.
+
+File: {file_path}
+Tool: {tool_name}
+Error: {_redact(error[:1000]) if error else "(none reported)"}{response_info}
+
+{sandboxed}
+
+Analyze:
+1. ROOT CAUSE: parse-error in sketch, missing file, ambiguous placeholder, or model decline?
+2. INSTRUCTION CLARITY: was the instruction explicit enough for the apply model?
+3. NEXT STEP: concrete suggestion (rephrase instruction, narrow sketch, switch to native Edit, etc.)
 
 Be concise and actionable."""
         + _COMPACT_ANALYSIS
@@ -1464,11 +1535,11 @@ def main() -> None:
 
     elif event in ("PostToolUse", "PostToolUseFailure"):
         tool_name = hook_data.get("tool_name", "")
-        routed = classify(tool_name, event)
+        tool_input = hook_data.get("tool_input", {})
+        routed = classify(tool_name, event, tool_input)
         if routed is None:
             sys.exit(0)
         category, model, effort = routed
-        tool_input = hook_data.get("tool_input", {})
 
         # Heuristic gating — upgrade/downgrade model+effort
         model, effort = _gate_model_effort(category, model, effort, tool_input)
@@ -1505,6 +1576,13 @@ def main() -> None:
                 tool_input, error, tool_response=tool_response, cwd=cwd
             )
             raw = invoke_codex(prompt, cwd, effort, model)
+            result = respond_bash_failure(raw, event_name=event)
+        elif category == "code_change_failure":
+            prompt = build_code_change_failure_prompt(
+                tool_name, tool_input, error, tool_response=tool_response, cwd=cwd
+            )
+            raw = invoke_codex(prompt, cwd, effort, model)
+            # Reuse respond_bash_failure — same diagnostic-only shape, no FAIL cache.
             result = respond_bash_failure(raw, event_name=event)
 
     else:
