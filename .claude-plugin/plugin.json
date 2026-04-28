@@ -1,6 +1,6 @@
 {
   "name": "codex-reflector",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Codex CLI reflector — independent critic, oracle, and metacognition layer",
   "author": {
     "name": "cognitive-glitch"
