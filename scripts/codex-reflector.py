@@ -302,6 +302,40 @@ _SKIP_TOOLS: frozenset[str] = frozenset(
 # MCP substrings for code-editing tools
 _MCP_EDIT_MARKERS: tuple[str, ...] = ("morph-mcp", "mcp__morph", "__edit_file")
 
+
+def _is_fast_apply(tool_name: str) -> bool:
+    """Detect Fast Apply (Morph etc.) — `mcp__*__edit_file` shape.
+
+    Name-only check; callers that need to confirm Morph payload semantics must
+    additionally verify `tool_input.code_edit` and `tool_input.instruction`
+    are present. See `build_code_review_prompt` Gate A and `classify`'s
+    PostToolUseFailure routing for the shape-confirming check.
+    """
+    return tool_name.startswith("mcp__") and "__edit_file" in tool_name
+
+
+def _is_safe_edit_path(path_str: str, cwd: str) -> bool:
+    """Allow Fast Apply post-edit disk read only under cwd or ~/.claude/plans.
+
+    Resolves relative paths against the hook-supplied `cwd`, not the reflector
+    process cwd. Returns False on any resolve error.
+    """
+    if not path_str or not cwd:
+        return False
+    try:
+        cwd_resolved = Path(cwd).resolve()
+        resolved = (cwd_resolved / path_str).resolve()
+    except (OSError, ValueError):
+        return False
+    plans_dir = Path.home() / ".claude" / "plans"
+    try:
+        return resolved.is_relative_to(cwd_resolved) or resolved.is_relative_to(
+            plans_dir
+        )
+    except ValueError:
+        return False
+
+
 # MCP substrings for thinking/metacognition tools
 _MCP_THINKING_MARKERS: tuple[str, ...] = (
     "sequentialthinking",
@@ -604,8 +638,29 @@ def build_code_review_prompt(
     old = tool_input.get("old_string", "")
     new = tool_input.get("new_string", "")
 
+    # Fast Apply: review input (sketch) AND output (post-edit file state).
+    fast_apply_snippet: str | None = None
+    if _is_fast_apply(tool_name):
+        code_edit = tool_input.get("code_edit", "")
+        instruction = tool_input.get("instruction", "")
+        if code_edit and instruction and _is_safe_edit_path(file_path, cwd):
+            try:
+                applied = Path(file_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )[:50_000]
+                fast_apply_snippet = _matryoshka_compact(
+                    f"Instruction: {_redact(instruction)}\n\n"
+                    f"--- sketch ---\n{_redact(code_edit)}\n\n"
+                    f"--- applied ---\n{_redact(applied)}",
+                    cwd=cwd,
+                )
+            except (OSError, UnicodeDecodeError) as e:
+                debug(f"fast-apply read failed: {e}")
+
     # Build snippet with redaction + smart truncation
-    if content:
+    if fast_apply_snippet:
+        snippet = fast_apply_snippet
+    elif content:
         snippet = _matryoshka_compact(_redact(content), cwd=cwd)
     elif old or new:
         snippet = f"--- old ---\n{_redact(old)}\n--- new ---\n{_redact(new)}"
