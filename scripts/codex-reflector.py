@@ -1479,6 +1479,24 @@ def run_self_test() -> None:
         if ok:
             all_passed += 1
 
+    # --- Fast Apply marker tests ---
+    print("\n=== Fast Apply Marker ===")
+    fast_apply_cases = [
+        ("mcp__edit__edit_file", True),
+        ("mcp__filesystem-with-morph__edit_file", True),
+        ("mcp__morphllm__edit_file", True),
+        ("Edit", False),
+        ("Write", False),
+    ]
+    for tool_name, expected in fast_apply_cases:
+        got = _is_fast_apply(tool_name)
+        ok = got == expected
+        status = "OK" if ok else "FAIL"
+        print(f"  {status}: _is_fast_apply({tool_name!r}) -> {got} (expected {expected})")
+        all_total += 1
+        if ok:
+            all_passed += 1
+
     print(f"\n{all_passed}/{all_total} passed")
     sys.exit(0 if all_passed == all_total else 1)
 
