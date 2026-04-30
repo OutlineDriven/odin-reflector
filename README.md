@@ -1,4 +1,10 @@
-# codex-reflector
+# Outline-Driven Development — Reflector
+
+> Codex CLI meta-reflection layer for Outline-Driven Development. Add-on for the Claude Code plugin.
+
+**Methodology**: [outline-driven-development](https://github.com/OutlineDriven/outline-driven-development) &nbsp;·&nbsp; **Claude Code plugin**: [odin-claude-plugin](https://github.com/OutlineDriven/odin-claude-plugin) &nbsp;·&nbsp; **Site**: [outlinedriven.github.io](https://outlinedriven.github.io)
+
+---
 
 Independent critic, oracle, and metacognition layer for Claude Code using OpenAI Codex CLI.
 
