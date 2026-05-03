@@ -51,10 +51,10 @@ _ME_CODE_REVIEW_HARD = ModelEffort(DEFAULT_MODEL, "high")  # risk signals
 _ME_CODE_REVIEW_COMPLEX = ModelEffort(DEFAULT_MODEL, "xhigh")
 _ME_CODE_REVIEW_TINY = ModelEffort(DEFAULT_MODEL, "low")  # trivial → low
 _ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")
-_ME_THINKING = ModelEffort(DEFAULT_MODEL, "xhigh")
+_ME_THINKING = ModelEffort(DEFAULT_MODEL, "medium")
 _ME_BASH_FAILURE = ModelEffort(DEFAULT_MODEL, "low")
-_ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "high")
-_ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "high")  # compaction
+_ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")
+_ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "medium")  # compaction
 _ME_SUMMARIZE = ModelEffort(FAST_MODEL, "high")
 _ME_SUBAGENT_REVIEW = ModelEffort(FAST_MODEL, "high")
 
@@ -1492,7 +1492,9 @@ def run_self_test() -> None:
         got = _is_fast_apply(tool_name)
         ok = got == expected
         status = "OK" if ok else "FAIL"
-        print(f"  {status}: _is_fast_apply({tool_name!r}) -> {got} (expected {expected})")
+        print(
+            f"  {status}: _is_fast_apply({tool_name!r}) -> {got} (expected {expected})"
+        )
         all_total += 1
         if ok:
             all_passed += 1
