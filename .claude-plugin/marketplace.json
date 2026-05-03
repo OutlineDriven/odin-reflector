@@ -1,6 +1,6 @@
 {
   "name": "odin-reflector",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Marketplace for the codex-reflector Claude Code plugin — independent second-model reviewer using OpenAI Codex CLI",
   "owner": {
     "name": "cognitive-glitch",
@@ -14,7 +14,7 @@
     {
       "name": "codex-reflector",
       "source": "./",
-      "version": "1.1.4",
+      "version": "1.1.5",
       "description": "Codex CLI reflector — independent critic, oracle, and metacognition layer using OpenAI Codex as second-model reviewer",
       "author": {
         "name": "cognitive-glitch"
@@ -30,7 +30,7 @@
     }
   ],
   "metadata": {
-    "lastUpdated": "2026-04-28",
+    "lastUpdated": "2026-05-04",
     "maintainer": "cognitive-glitch",
     "website": "https://github.com/OutlineDriven/codex-reflector",
     "support": "https://github.com/OutlineDriven/codex-reflector/issues"
