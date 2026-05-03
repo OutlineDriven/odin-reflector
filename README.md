@@ -21,6 +21,24 @@ Claude Code acts. Codex reviews. Every code change gets a second opinion. Every 
 claude plugin marketplace add OutlineDriven/odin-reflector; claude plugin install codex-reflector@odin-reflector
 ```
 
+### Install as a Cursor Plugin
+
+This repository now includes native Cursor plugin metadata at `.cursor-plugin/plugin.json`.
+
+To install it as a local Cursor plugin, copy or symlink this repository into:
+
+```bash
+~/.cursor/plugins/local/codex-reflector
+```
+
+Then reload Cursor. The plugin components are auto-discovered from this repository:
+
+- `hooks/hooks.json`
+- `rules/codex-reflector-usage.mdc`
+- `skills/codex-reflector/SKILL.md`
+- `agents/codex-reflector-reviewer.md`
+- `commands/install-cursor-plugin.md`
+
 ## Use with Cursor
 
 Cursor can run this plugin through its Claude Code third-party hooks compatibility layer.

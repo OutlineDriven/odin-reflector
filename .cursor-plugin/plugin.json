@@ -5,5 +5,13 @@
   "author": {
     "name": "cognitive-glitch"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "keywords": [
+    "codex",
+    "hooks",
+    "code-review",
+    "metacognition",
+    "cursor",
+    "claude"
+  ]
 }

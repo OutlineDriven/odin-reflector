@@ -1,0 +1,31 @@
+{
+  "name": "odin-reflector",
+  "version": "1.1.4",
+  "description": "Marketplace metadata for the codex-reflector plugin",
+  "owner": {
+    "name": "cognitive-glitch",
+    "url": "https://github.com/OutlineDriven"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OutlineDriven/codex-reflector"
+  },
+  "plugins": [
+    {
+      "name": "codex-reflector",
+      "source": "./",
+      "version": "1.1.4",
+      "description": "Codex CLI reflector for independent second-model review in Claude Code and Cursor",
+      "author": {
+        "name": "cognitive-glitch"
+      },
+      "tags": [
+        "codex",
+        "reflector",
+        "hooks",
+        "cursor",
+        "claude"
+      ]
+    }
+  ]
+}

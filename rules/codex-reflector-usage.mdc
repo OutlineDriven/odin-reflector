@@ -1,0 +1,12 @@
+---
+description: Use codex-reflector hooks for second-model review on risky code and planning actions.
+alwaysApply: false
+---
+
+# Codex Reflector Usage
+
+When editing code in this repository:
+
+1. Prefer normal project workflows; codex-reflector runs through hooks and provides second-model feedback.
+2. Treat FAIL findings from the reflector as required follow-up work before considering a task complete.
+3. Keep verdict lines at the top of reviewer outputs (`PASS` or `FAIL`) to preserve parser reliability.
