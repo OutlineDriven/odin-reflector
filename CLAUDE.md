@@ -5,7 +5,7 @@ Claude Code plugin that routes hook events to OpenAI Codex CLI for independent s
 ## Commands
 
 ```bash
-# Self-test (verdict parser + plan path extraction + synthetic path guards, 28 cases)
+# Self-test (verdict parser + plan path extraction + synthetic path guards + Cursor normalization)
 python3 scripts/codex-reflector.py --test-parse
 
 # Lint
@@ -16,6 +16,17 @@ CODEX_REFLECTOR_DEBUG=1
 ```
 
 No build step. No pip dependencies — stdlib only.
+
+## Cursor third-party compatibility
+
+Cursor can run this repo through its Claude Code third-party hooks compatibility layer.
+
+- `.claude/settings.json` is the direct-export hook wiring Cursor reads. It mirrors the 4 plugin events and uses `CLAUDE_PROJECT_DIR` for this checkout.
+- `scripts/install-cursor.sh` installs the same wiring into `~/.claude/settings.json` or `<project>/.claude/settings.json` with absolute paths for cross-project use.
+- `_normalize_cursor_input()` is the only Cursor-specific adapter. It maps Cursor event names, `conversation_id`, `workspace_roots`, `tool_output`, `Shell` failures, and Stop `loop_count` into the Claude-shaped fields the existing router expects.
+- Cursor accepts Claude's nested `hookSpecificOutput` response format, so output builders stay Claude-shaped.
+- Cursor does not currently map Claude `PostToolUseFailure`; that hook remains exported for Claude parity but may not fire in Cursor.
+- Cursor treats Claude `Stop` blocks as follow-up messages, so unresolved FAIL reviews continue the agent with Codex feedback instead of hard-stopping the Cursor UI.
 
 ## Architecture
 

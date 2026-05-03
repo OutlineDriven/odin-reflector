@@ -1347,6 +1347,54 @@ def respond_precompact(
     return {"systemMessage": f"Session metacognition (by Codex):\n{raw_output}"}
 
 
+_CURSOR_EVENT_MAP = {
+    "preToolUse": "PreToolUse",
+    "postToolUse": "PostToolUse",
+    "postToolUseFailure": "PostToolUseFailure",
+    "stop": "Stop",
+    "subagentStop": "SubagentStop",
+    "sessionStart": "SessionStart",
+    "sessionEnd": "SessionEnd",
+    "beforeSubmitPrompt": "UserPromptSubmit",
+    "preCompact": "PreCompact",
+}
+
+
+def _normalize_cursor_input(hook_data: dict) -> dict:
+    """Map Cursor-shaped hook payloads into the Claude-shaped fields we route on."""
+    event = hook_data.get("hook_event_name")
+    if event in _CURSOR_EVENT_MAP:
+        hook_data["hook_event_name"] = _CURSOR_EVENT_MAP[event]
+
+    if "conversation_id" in hook_data and "session_id" not in hook_data:
+        hook_data["session_id"] = hook_data["conversation_id"]
+
+    if "workspace_roots" in hook_data and not hook_data.get("cwd"):
+        roots = hook_data.get("workspace_roots") or []
+        if roots:
+            hook_data["cwd"] = roots[0]
+
+    if "tool_output" in hook_data and "tool_response" not in hook_data:
+        try:
+            hook_data["tool_response"] = json.loads(hook_data["tool_output"])
+        except (json.JSONDecodeError, TypeError):
+            hook_data["tool_response"] = hook_data["tool_output"]
+
+    if (
+        hook_data.get("hook_event_name") == "PostToolUseFailure"
+        and hook_data.get("tool_name") == "Shell"
+    ):
+        hook_data["tool_name"] = "Bash"
+
+    if "loop_count" in hook_data and "stop_hook_active" not in hook_data:
+        try:
+            hook_data["stop_hook_active"] = int(hook_data.get("loop_count", 0)) > 0
+        except (TypeError, ValueError):
+            hook_data["stop_hook_active"] = False
+
+    return hook_data
+
+
 # ---------------------------------------------------------------------------
 # Self-test mode
 # ---------------------------------------------------------------------------
@@ -1499,6 +1547,92 @@ def run_self_test() -> None:
         if ok:
             all_passed += 1
 
+    # --- Cursor input normalization tests ---
+    print("\n=== Cursor Input Normalization ===")
+    cursor_post = _normalize_cursor_input(
+        {
+            "hook_event_name": "postToolUse",
+            "conversation_id": "conv-123",
+            "workspace_roots": ["/tmp/project"],
+            "tool_output": '{"filePath": "README.md"}',
+        }
+    )
+    cursor_stop_first = _normalize_cursor_input(
+        {
+            "hook_event_name": "stop",
+            "conversation_id": "conv-123",
+            "loop_count": 0,
+        }
+    )
+    cursor_stop_loop = _normalize_cursor_input(
+        {
+            "hook_event_name": "stop",
+            "conversation_id": "conv-123",
+            "loop_count": 2,
+        }
+    )
+    cursor_shell_failure = _normalize_cursor_input(
+        {
+            "hook_event_name": "postToolUseFailure",
+            "tool_name": "Shell",
+        }
+    )
+    claude_passthrough_input = {
+        "hook_event_name": "Stop",
+        "session_id": "sid-123",
+        "stop_hook_active": True,
+    }
+    claude_passthrough = _normalize_cursor_input(dict(claude_passthrough_input))
+    normalizer_cases = [
+        (
+            "cursor postToolUse event maps to Claude event",
+            cursor_post.get("hook_event_name"),
+            "PostToolUse",
+        ),
+        (
+            "cursor conversation_id maps to session_id",
+            cursor_post.get("session_id"),
+            "conv-123",
+        ),
+        (
+            "cursor workspace root maps to cwd",
+            cursor_post.get("cwd"),
+            "/tmp/project",
+        ),
+        (
+            "cursor JSON tool_output maps to tool_response",
+            cursor_post.get("tool_response"),
+            {"filePath": "README.md"},
+        ),
+        (
+            "cursor first stop allows review",
+            cursor_stop_first.get("stop_hook_active"),
+            False,
+        ),
+        (
+            "cursor looped stop prevents recursion",
+            cursor_stop_loop.get("stop_hook_active"),
+            True,
+        ),
+        (
+            "cursor Shell failure maps to Bash failure",
+            cursor_shell_failure.get("tool_name"),
+            "Bash",
+        ),
+        (
+            "Claude payload passes through unchanged",
+            claude_passthrough,
+            claude_passthrough_input,
+        ),
+    ]
+    for desc, got, expected in normalizer_cases:
+        ok = got == expected
+        status = "OK" if ok else "FAIL"
+        print(f"  {status}: {desc}: got={got!r} expected={expected!r}")
+        all_total += 1
+        if ok:
+            all_passed += 1
+
     print(f"\n{all_passed}/{all_total} passed")
     sys.exit(0 if all_passed == all_total else 1)
 
@@ -1522,6 +1656,8 @@ def main() -> None:
         hook_data = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, OSError):
         sys.exit(0)  # fail-open
+
+    hook_data = _normalize_cursor_input(hook_data)
 
     event = hook_data.get("hook_event_name", "")
     cwd = hook_data.get("cwd", os.getcwd())

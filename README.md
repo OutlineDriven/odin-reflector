@@ -21,6 +21,32 @@ Claude Code acts. Codex reviews. Every code change gets a second opinion. Every 
 claude plugin marketplace add OutlineDriven/odin-reflector; claude plugin install codex-reflector@odin-reflector
 ```
 
+## Use with Cursor
+
+Cursor can run this plugin through its Claude Code third-party hooks compatibility layer.
+
+1. Enable **Third-party skills** in Cursor Settings.
+2. Install the direct-export Claude settings:
+
+```bash
+scripts/install-cursor.sh
+```
+
+That writes `~/.claude/settings.json` with absolute paths to this checkout. To install into a specific project instead, pass the project path:
+
+```bash
+scripts/install-cursor.sh /path/to/project
+```
+
+When this repository itself is opened in Cursor, the checked-in `.claude/settings.json` also works directly because Cursor provides `CLAUDE_PROJECT_DIR`.
+
+Cursor compatibility notes:
+
+- `PostToolUse`, `Stop`, and `PreCompact` run through Cursor's Claude hook compatibility.
+- `PostToolUseFailure` is included in the export for Claude parity, but Cursor does not currently list it in its Claude hook mapping table.
+- Cursor treats Claude `Stop` blocks as follow-up messages, so unresolved FAIL reviews cause the agent to continue with Codex feedback instead of hard-stopping the UI.
+- The direct export mirrors the Claude plugin matcher. Cursor only fires the parts whose tool names are exposed through its Claude hook compatibility layer.
+
 ## Hook Events
 
 | Event | Trigger | Mode | Purpose |
