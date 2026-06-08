@@ -51,7 +51,6 @@ done
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 plugin_root=$(dirname -- "$script_dir")
 reflector_script="${plugin_root}/scripts/codex-reflector.py"
-codex_command="python3 \"${reflector_script}\""
 
 if [ ! -f "$reflector_script" ]; then
   printf '%s\n' "Cannot find codex-reflector.py at: $reflector_script" >&2
