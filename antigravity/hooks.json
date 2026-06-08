@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "REFLECTOR_HOST=antigravity python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/antigravity-reflector-hook.sh\"",
             "timeout": 240
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "REFLECTOR_HOST=antigravity python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/antigravity-reflector-hook.sh\"",
             "timeout": 120
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "REFLECTOR_HOST=antigravity python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/antigravity-reflector-hook.sh\"",
             "timeout": 240
           }
         ]
@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "REFLECTOR_HOST=antigravity python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/antigravity-reflector-hook.sh\"",
             "timeout": 240
           }
         ]

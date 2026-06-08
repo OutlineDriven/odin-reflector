@@ -112,13 +112,16 @@ hooks = {
 if pre_edit:
     # Opt-in pre-edit deny gate (maps via Cursor's preToolUse). Synchronous —
     # the edit waits on it — so a shorter timeout than the post-event hooks. The
-    # script still self-gates on REFLECTOR_PREEDIT_BLOCK at runtime, so this is
-    # inert unless that env var is set.
+    # --pre-edit flag SETS REFLECTOR_PREEDIT_BLOCK=1 inline so the gate is actually
+    # ACTIVE (Cursor runs hook commands through a shell, like grok/codex);
+    # respond_pretooluse still self-gates on it, and the default install (no
+    # --pre-edit) wires no PreToolUse hook at all.
+    pre_edit_command = f"REFLECTOR_PREEDIT_BLOCK=1 {command}"
     hooks["PreToolUse"] = [
         {
             "matcher": "Write|Edit|MultiEdit|Patch|NotebookEdit|mcp__.*edit.*|mcp__.*morph.*",
             "hooks": [
-                {"type": "command", "command": command, "timeout": 120},
+                {"type": "command", "command": pre_edit_command, "timeout": 120},
             ],
         }
     ]

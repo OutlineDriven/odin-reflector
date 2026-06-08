@@ -2864,9 +2864,9 @@ def _normalize_input(host: str, hook_data: dict) -> dict:
     `_normalize_codex_input` — identity for the common case, but re-emits
     `PostToolUseFailure` from an error-carrying PostToolUse payload (B4) so the
     failure-diagnostic flow is live on Codex. cursor uses the existing
-    `_normalize_cursor_input`. grok (U10) / antigravity (U11) normalizers are
-    deliberately NOT implemented here — they fall through to identity with a
-    debug note, a clean extension point.
+    `_normalize_cursor_input`. grok uses `_normalize_grok_input` (U10) and
+    antigravity uses `_normalize_antigravity_input` (U11); any unknown host falls
+    through to identity.
     """
     if host == "codex":
         return _normalize_codex_input(hook_data)
@@ -3241,6 +3241,12 @@ def run_self_test() -> None:
             "--dangerously-skip-permissions",
             "acceptEdits",
             "bypassPermissions",
+            # Write-enabling levers across the 5 backends' installed CLIs — none
+            # may ever appear in a reviewer argv (belt-and-suspenders vs INV-READONLY).
+            "--no-plan",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "workspace-write",
+            "danger-full-access",
         }
         lever_expect = {
             "codex": ["--sandbox", "read-only"],
