@@ -13,6 +13,7 @@ Env vars:
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import json
 import os
@@ -57,6 +58,186 @@ _ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")
 _ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "medium")  # compaction
 _ME_SUMMARIZE = ModelEffort(FAST_MODEL, "high")
 _ME_SUBAGENT_REVIEW = ModelEffort(FAST_MODEL, "high")
+
+# ---------------------------------------------------------------------------
+# Reviewer backend registry (Axis A) — data-driven per-CLI invocation specs
+# ---------------------------------------------------------------------------
+#
+# Each Backend row describes how to shell out to one external reviewer CLI in
+# read-only print mode. `invoke_backend()` consumes these rows; selection and
+# fan-out arrive in later units. Until then codex is the only backend invoked,
+# and the codex row is byte-identical to the legacy `invoke_codex` argv because
+# it delegates to the SAME `_codex_argv()` builder (INV-CODEX-PATH-STABLE / M-D).
+#
+# Fields:
+#   bin            - executable name
+#   subcmd         - subcommand list inserted right after bin (e.g. ["exec"])
+#   read_only_argv - read-only / sandbox lever args (INV-READONLY); non-optional
+#   model_argv     - fn(model)  -> argv fragment selecting the model
+#   effort_argv    - fn(effort) -> argv fragment | None when the CLI has no effort knob
+#   prompt_delivery- one of {"stdin","positional","flag_value","prompt_file"}
+#   output_capture - one of {"file","stdout"}
+#   default_model  - model used when no per-call model is supplied
+#   timeout        - hard wall-clock seconds for subprocess.run(timeout=)
+#   stdin_devnull  - True -> stdin=DEVNULL (agy)
+#   argv_builder   - fn(model, effort) -> deterministic argv prefix, or None.
+#                    When present (codex), it REPLACES bin/subcmd/read_only/
+#                    model/effort assembly so the legacy argv is reproduced
+#                    exactly (the fixed codex flags --skip-git-repo-check /
+#                    --full-auto / --ephemeral live only in the builder).
+#   prompt_file_threshold - byte threshold above which a flag_value backend
+#                    spills the prompt to a temp file (grok --prompt-file).
+#   extra_argv     - fixed trailing flags appended after model_argv, before the
+#                    prompt (e.g. claude --output-format text to force plain
+#                    text — INV-VERDICT-TEXT). Ignored by argv_builder backends.
+Backend = namedtuple(
+    "Backend",
+    [
+        "bin",
+        "subcmd",
+        "read_only_argv",
+        "model_argv",
+        "effort_argv",
+        "prompt_delivery",
+        "output_capture",
+        "default_model",
+        "timeout",
+        "stdin_devnull",
+        "argv_builder",
+        "prompt_file_threshold",
+        "extra_argv",
+    ],
+)
+
+
+def _codex_argv(model: str, effort: str, apply_override: bool = True) -> list[str]:
+    """Deterministic `codex exec` argv PREFIX (no -o/-).
+
+    Folds the LIGHTNING_FAST low/medium -> high effort bump exactly as the legacy
+    invoke_codex did, so the codex reviewer argv stays byte-identical to today
+    (INV-CODEX-PATH-STABLE, M-D). Callers append output-capture (-o <tmp>) then
+    prompt-delivery (-).
+
+    `apply_override` (KTD-4): when True (the codex REVIEWER row), the codex-scoped
+    model override REFLECTOR_MODEL (else its alias CODEX_REFLECTOR_MODEL) replaces
+    the model. The SUMMARIZER (invoke_codex) calls with apply_override=False so it
+    stays pinned to FAST_MODEL and ignores both env vars. With neither env var set
+    the two paths are byte-identical to today (the override is a no-op).
+    """
+    if apply_override:
+        override = os.environ.get("REFLECTOR_MODEL") or os.environ.get(
+            "CODEX_REFLECTOR_MODEL"
+        )
+    else:
+        override = None
+    model = override or model or DEFAULT_MODEL
+    # Lightning-fast model needs at least high effort
+    if model == LIGHTNING_FAST_MODEL and effort in ("low", "medium"):
+        effort = "high"
+    return [
+        "codex",
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        "--full-auto",
+        "--ephemeral",
+        "-c",
+        f"model_reasoning_effort={effort}",
+        "-m",
+        model,
+    ]
+
+
+BACKENDS: dict[str, Backend] = {
+    "codex": Backend(
+        bin="codex",
+        subcmd=["exec"],
+        read_only_argv=["--sandbox", "read-only"],
+        model_argv=lambda m: ["-m", m],
+        effort_argv=lambda e: ["-c", f"model_reasoning_effort={e}"],
+        prompt_delivery="stdin",
+        output_capture="file",
+        default_model=DEFAULT_MODEL,
+        timeout=100,
+        stdin_devnull=False,
+        argv_builder=_codex_argv,
+        prompt_file_threshold=0,
+        extra_argv=[],
+    ),
+    "claude": Backend(
+        bin="claude",
+        subcmd=["-p"],
+        read_only_argv=["--permission-mode", "plan"],
+        model_argv=lambda m: ["--model", m],
+        effort_argv=None,
+        prompt_delivery="positional",
+        output_capture="stdout",
+        # claude --model accepts an alias ('sonnet'/'opus') or a full id; NOT an
+        # OpenAI id. Must not inherit codex DEFAULT_MODEL (gpt-5.5). U12 verifies.
+        default_model="sonnet",
+        timeout=120,
+        stdin_devnull=False,
+        argv_builder=None,
+        prompt_file_threshold=0,
+        extra_argv=["--output-format", "text"],
+    ),
+    "cursor-agent": Backend(
+        bin="cursor-agent",
+        subcmd=["-p"],
+        read_only_argv=["--mode", "plan"],
+        model_argv=lambda m: ["--model", m],
+        effort_argv=None,
+        prompt_delivery="positional",
+        output_capture="stdout",
+        # cursor-agent --model example ids are gpt-5 / sonnet-4 (NOT an OpenAI
+        # codex id). Must not inherit codex DEFAULT_MODEL (gpt-5.5). U12 verifies.
+        default_model="sonnet-4",
+        timeout=120,
+        stdin_devnull=False,
+        argv_builder=None,
+        prompt_file_threshold=0,
+        extra_argv=[],
+    ),
+    "grok": Backend(
+        # grok 0.2.33 --help: `-p, --single <PROMPT>` is a value-taking flag (NOT
+        # a boolean) and inline file delivery is `--prompt-file <PATH>` (there is
+        # no `--prompt`). So `-p`/`--single` must carry the prompt value, never
+        # sit in subcmd where it would swallow the next flag. The flag_value
+        # delivery mechanism supplies `--single <text>` (under threshold) or
+        # `--prompt-file <path>` (over it).
+        bin="grok",
+        subcmd=[],
+        read_only_argv=["--permission-mode", "plan", "--sandbox", "read-only"],
+        model_argv=lambda m: ["-m", m],
+        effort_argv=None,
+        prompt_delivery="flag_value",
+        output_capture="stdout",
+        default_model="grok-code-fast-1",
+        timeout=120,
+        stdin_devnull=False,
+        argv_builder=None,
+        prompt_file_threshold=32_000,
+        extra_argv=[],
+    ),
+    "agy": Backend(
+        bin="agy",
+        subcmd=["-p"],
+        read_only_argv=["--sandbox"],
+        model_argv=lambda m: ["--model", m],
+        effort_argv=None,
+        prompt_delivery="positional",
+        output_capture="stdout",
+        default_model="gemini-3-pro",
+        timeout=120,
+        stdin_devnull=True,
+        argv_builder=None,
+        prompt_file_threshold=0,
+        # --print-timeout is agy's INNER soft bound; subprocess.run(timeout=120)
+        # is the OUTER hard wall-clock kill that always wins (M3). Inner < outer.
+        extra_argv=["--print-timeout", "110"],
+    ),
+}
 
 # Compact output directives — verdict vs non-verdict prompts.
 _COMPACT_VERDICT = """
@@ -593,34 +774,26 @@ def _find_latest_plan_global() -> tuple[str, str] | None:
 
 
 def invoke_codex(prompt: str, cwd: str, effort: str = "medium", model: str = "") -> str:
-    """Call `codex exec` in read-only sandbox. Returns raw output or ''."""
-    # Env var override takes precedence, then passed model, then DEFAULT_MODEL
-    model = os.environ.get("CODEX_REFLECTOR_MODEL", model or DEFAULT_MODEL)
-    # Lightning-fast model needs at least high effort
-    if model == LIGHTNING_FAST_MODEL and effort in ("low", "medium"):
-        effort = "high"
+    """Call `codex exec` in read-only sandbox. Returns raw output or ''.
 
+    PRIVATE summarization engine — hard-pinned to codex + caller-supplied model
+    (the summarizer passes FAST_MODEL). Reviewer call sites go through
+    `invoke_backend` instead. Argv is built from `_codex_argv` so it stays
+    byte-identical to the codex backend row (INV-CODEX-PATH-STABLE).
+    """
     fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex-ref-")
     os.close(fd)
     try:
-        cmd = [
-            "codex",
-            "exec",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "--full-auto",
-            "--ephemeral",
-            "-c",
-            f"model_reasoning_effort={effort}",
-            "-m",
-            model,
+        # apply_override=False pins the summarizer to FAST_MODEL (KTD-4); it must
+        # ignore REFLECTOR_MODEL / CODEX_REFLECTOR_MODEL. Byte-identical to today
+        # when neither var is set (INV-CODEX-PATH-STABLE).
+        cmd = _codex_argv(model, effort, apply_override=False) + [
             "-o",
             out_path,
             "-",  # read prompt from stdin
         ]
 
-        debug(f"invoking: {' '.join(cmd)} (effort={effort}, model={model})")
+        debug(f"invoking: {' '.join(cmd)} (effort={effort})")
         subprocess.run(
             cmd,
             input=prompt,
@@ -640,6 +813,280 @@ def invoke_codex(prompt: str, cwd: str, effort: str = "medium", model: str = "")
             os.unlink(out_path)
         except OSError:
             pass
+
+
+def _build_backend_argv(
+    spec: Backend, model: str, effort: str, out_path: str
+) -> list[str]:
+    """Assemble the argv prefix (everything except prompt delivery) for a backend.
+
+    The codex row delegates to `_codex_argv` so its argv is reproduced exactly,
+    including the model override and LIGHTNING effort bump. Other backends build
+    generically from their spec fields. `out_path` is appended only for the
+    file-capture (`-o`) mechanism; stdout backends ignore it.
+    """
+    if spec.argv_builder is not None:
+        argv = spec.argv_builder(model, effort)
+    else:
+        model = model or spec.default_model
+        argv = [spec.bin, *spec.subcmd, *spec.read_only_argv]
+        if spec.effort_argv is not None:
+            argv += spec.effort_argv(effort)
+        argv += spec.model_argv(model)
+        argv += spec.extra_argv
+    if spec.output_capture == "file":
+        argv += ["-o", out_path]
+    return argv
+
+
+def invoke_backend(
+    prompt: str,
+    cwd: str,
+    effort: str,
+    model: str,
+    backend: Backend,
+) -> str:
+    """Invoke one reviewer backend per its spec. Returns raw output or '' (fail-open).
+
+    Delivers the prompt via the spec's `prompt_delivery` mechanism, captures
+    output per `output_capture`, runs under `subprocess.run(timeout=spec.timeout)`,
+    and is fail-open on TimeoutExpired / FileNotFoundError / OSError. The codex
+    row reproduces the legacy invoke_codex behavior exactly.
+    """
+    out_fd = out_path = None
+    prompt_path = None
+    if spec_needs_outfile(backend):
+        out_fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex-ref-")
+        os.close(out_fd)
+    try:
+        argv = _build_backend_argv(backend, model, effort, out_path or "")
+
+        # Prompt delivery
+        run_input: str | None = None
+        run_stdin = None
+        delivery = backend.prompt_delivery
+        if delivery == "stdin":
+            argv.append("-")
+            run_input = prompt
+        elif delivery == "positional":
+            argv.append(prompt)
+        elif delivery == "flag_value":
+            # grok: `--single <PROMPT>` inline, spilling to `--prompt-file <PATH>`
+            # over a byte threshold (grok 0.2.33 --help; there is no `--prompt`).
+            if (
+                backend.prompt_file_threshold
+                and len(prompt) >= backend.prompt_file_threshold
+            ):
+                pf_fd, prompt_path = tempfile.mkstemp(
+                    suffix=".txt", prefix="codex-ref-prompt-"
+                )
+                with os.fdopen(pf_fd, "w") as pf:
+                    pf.write(prompt)
+                argv += ["--prompt-file", prompt_path]
+            else:
+                argv += ["--single", prompt]
+        elif delivery == "prompt_file":
+            pf_fd, prompt_path = tempfile.mkstemp(
+                suffix=".txt", prefix="codex-ref-prompt-"
+            )
+            with os.fdopen(pf_fd, "w") as pf:
+                pf.write(prompt)
+            argv += ["--prompt-file", prompt_path]
+
+        if backend.stdin_devnull:
+            run_stdin = subprocess.DEVNULL
+            run_input = None
+
+        debug(f"invoking: {' '.join(argv)} (effort={effort}, backend={backend.bin})")
+        proc = subprocess.run(
+            argv,
+            input=run_input,
+            stdin=run_stdin,
+            text=True,
+            capture_output=True,
+            timeout=backend.timeout,
+            cwd=cwd,
+        )
+        if backend.output_capture == "file":
+            result = Path(out_path).read_text(errors="replace").strip()
+        else:
+            result = (proc.stdout or "").strip()
+        debug(f"{backend.bin} returned {len(result)} chars")
+        return result
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        debug(f"{backend.bin} error: {exc}")
+        return ""  # fail-open
+    finally:
+        for p in (out_path, prompt_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def spec_needs_outfile(spec: Backend) -> bool:
+    """True when the backend captures output via a `-o` temp file (codex)."""
+    return spec.output_capture == "file"
+
+
+# ---------------------------------------------------------------------------
+# Reviewer selection, fan-out, and verdict merge (Axis A orchestration)
+# ---------------------------------------------------------------------------
+
+# Sentinel returned by merge_verdicts when no reviewer produced output (every
+# result was infra-empty). Callers map it to today's empty-output behavior:
+# PostToolUse non-blocking, Stop return-None/approve. It is intentionally NOT a
+# verdict string so it can never be mistaken for PASS/FAIL/UNCERTAIN (INV-MERGE).
+MERGE_EMPTY = None
+
+
+def resolve_backends() -> list[str]:
+    """Resolve the ordered, deduped reviewer backend name list (KTD-2/KTD-4).
+
+    Selection precedence (independent of model): REFLECTOR_BACKENDS (plural,
+    comma-separated) -> REFLECTOR_BACKEND (singular alias) -> CODEX_REFLECTOR_BACKEND
+    -> "codex". Names are stripped, lowercased, empties dropped, and deduped while
+    preserving order (dict.fromkeys — documented key). Unknown names are dropped
+    with a debug line; if ANY recognized names remain, the recognized remainder is
+    kept. An empty/all-whitespace value, or an all-unknown set, yields [] only for
+    the all-unknown case — empty/whitespace falls back to ["codex"].
+    """
+    raw = (
+        os.environ.get("REFLECTOR_BACKENDS")
+        or os.environ.get("REFLECTOR_BACKEND")
+        or os.environ.get("CODEX_REFLECTOR_BACKEND")
+        or "codex"
+    )
+    names = [n.strip().lower() for n in raw.split(",")]
+    names = [n for n in names if n]
+    names = list(dict.fromkeys(names))  # dedupe, preserve order
+    if not names:
+        return ["codex"]  # empty / all-whitespace -> default
+    recognized = [n for n in names if n in BACKENDS]
+    unknown = [n for n in names if n not in BACKENDS]
+    for n in unknown:
+        debug(f"unknown reviewer backend dropped: {n}")
+    # All-unknown -> [] so the caller can fail-open (no-op exit 0).
+    return recognized
+
+
+# Stable, human-readable labels per backend name (KTD-6). codex MUST map to the
+# exact strings used by the legacy single-reviewer responders so the default
+# path stays byte-identical: REVIEWER_LABEL(["codex"]) == "Codex".
+_BACKEND_LABELS: dict[str, str] = {
+    "codex": "Codex",
+    "claude": "Claude",
+    "cursor-agent": "Cursor",
+    "grok": "Grok",
+    "agy": "Antigravity",
+}
+
+
+def REVIEWER_LABEL(backends: list[str]) -> str:
+    """Human label for the active reviewer set, joined in config order (KTD-6).
+
+    REVIEWER_LABEL(["codex"]) == "Codex" exactly (default byte-identical). N>1 is
+    a stable config-ordered "+"-join, e.g. ["codex","claude"] -> "Codex+Claude".
+    """
+    if not backends:
+        return "Codex"
+    return "+".join(_BACKEND_LABELS.get(n, n) for n in backends)
+
+
+def merge_verdicts(results: list[tuple[str, str]]) -> str | None:
+    """Fold per-reviewer (name, raw) results into one verdict (KTD-11 / INV-MERGE).
+
+    Pure function. (1) Drop every raw=="" result — infra-empty (timeout/missing
+    binary/fail-open) is NOT a verdict and must never become UNCERTAIN. (2)
+    parse_verdict each SURVIVOR's OWN raw text (never concatenate-then-parse,
+    which would collapse to a spurious UNCERTAIN). (3) Lattice: any FAIL -> FAIL,
+    else any UNCERTAIN -> UNCERTAIN, else PASS. (4) Empty survivor set -> MERGE_EMPTY
+    sentinel (today's empty-output behavior).
+    """
+    survivors = [(name, raw) for name, raw in results if raw != ""]
+    if not survivors:
+        return MERGE_EMPTY
+    verdicts = [parse_verdict(raw) for _, raw in survivors]
+    if "FAIL" in verdicts:
+        return "FAIL"
+    if "UNCERTAIN" in verdicts:
+        return "UNCERTAIN"
+    return "PASS"
+
+
+def _backend_call_model(name: str, spec: Backend, model: str) -> str:
+    """Per-backend model for invoke_backend (KTD-3/KTD-4).
+
+    codex member: the gated model is passed through (the codex-scoped env
+    override is applied inside _codex_argv, so it wins regardless). Every
+    non-codex backend ALWAYS uses its own default_model — the model env override
+    never reaches grok/cursor-agent/claude/agy.
+    """
+    if name == "codex":
+        return model
+    return spec.default_model
+
+
+def fan_out(
+    prompt: str,
+    cwd: str,
+    effort: str,
+    model: str,
+    backends: list[str],
+) -> list[tuple[str, str]]:
+    """Invoke each reviewer over the SAME prompt; return (name, raw) in config order.
+
+    N=1 short-circuit (KTD-2/INV-CODEX-PATH-STABLE): a single backend is invoked
+    inline with NO executor, so the default path never touches threads. N>1 uses a
+    ThreadPoolExecutor(max_workers=len(backends)); results are collected IN CONFIG
+    ORDER via [f.result() ...] (NOT as_completed) for deterministic display. Each
+    future is pure (invoke_backend owns its own mkstemp tmpfile; no shared state).
+    """
+    if not backends:
+        return []
+    if len(backends) == 1:
+        name = backends[0]
+        spec = BACKENDS[name]
+        raw = invoke_backend(
+            prompt, cwd, effort, _backend_call_model(name, spec, model), spec
+        )
+        return [(name, raw)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(backends)) as ex:
+        futures = []
+        for name in backends:
+            spec = BACKENDS[name]
+            futures.append(
+                ex.submit(
+                    invoke_backend,
+                    prompt,
+                    cwd,
+                    effort,
+                    _backend_call_model(name, spec, model),
+                    spec,
+                )
+            )
+        return [(name, f.result()) for name, f in zip(backends, futures)]
+
+
+def format_reviewer_blocks(results: list[tuple[str, str]]) -> str:
+    """Join survivors' outputs as per-reviewer labeled blocks in config order.
+
+    Infra-empty (raw=="") results are dropped. Each surviving block is prefixed
+    with an inline "[<label>: <verdict>]" header so the agent sees every
+    contributor and its verdict. Single-survivor output is returned verbatim
+    (no inline header) so the default single-reviewer body stays byte-identical.
+    """
+    survivors = [(name, raw) for name, raw in results if raw != ""]
+    if not survivors:
+        return ""
+    if len(survivors) == 1:
+        return survivors[0][1]
+    blocks = []
+    for name, raw in survivors:
+        label = _BACKEND_LABELS.get(name, name)
+        blocks.append(f"[{label}: {parse_verdict(raw)}]\n{raw}")
+    return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -847,11 +1294,23 @@ def build_bash_failure_prompt(
     if extra:
         extra_block = "\n\nContext-specific:\n" + "\n".join(f"- {e}" for e in extra)
 
+    # Wrap attacker-controllable inputs (the command string, its error, and any
+    # captured stdout/stderr) in a sandbox block so injected directives in build
+    # output cannot steer the reviewer. _redact strips secrets, not injection
+    # directives — sandboxing is the prompt-injection lever (mirrors the sibling
+    # build_code_change_failure_prompt). The command-type heuristics above read
+    # the raw `command` variable directly, so they are unaffected.
+    sandboxed = _sandbox_content(
+        "bash-failure",
+        f"Command: {_redact(command)}\n"
+        f"Error: {_matryoshka_compact(_redact(error), max_chars=20_000, cwd=cwd)}"
+        f"{response_info}",
+    )
+
     return (
         f"""A bash command failed. Perform structured root cause analysis.
 
-Command: {_redact(command)}
-Error: {_matryoshka_compact(_redact(error), max_chars=20_000, cwd=cwd)}{response_info}
+{sandboxed}
 {extra_block}
 
 Analyze:
@@ -1022,13 +1481,12 @@ If FAIL, each bullet: <Category>: <Problem>. Fix: <Action>."""
 
 def build_precompact_prompt(transcript_content: str, cwd: str = "") -> str:
     truncated = _matryoshka_compact(_redact(transcript_content), cwd=cwd)
+    sandboxed = _sandbox_content("transcript", truncated)
     return (
         f"""You are a metacognition layer reflecting on agent session quality before compaction.
 The following is the tail of the conversation transcript.
 
-```
-{truncated}
-```
+{sandboxed}
 
 Analyze the session across these dimensions and surface actionable insights:
 - Reasoning quality: logical gaps, premature conclusions, missed alternatives
@@ -1167,8 +1625,13 @@ def respond_code_review(
     raw_output: str,
     cwd: str = "",
     event_name: str = "PostToolUse",
+    label: str = "Codex",
+    verdict: str | None = None,
 ) -> dict:
-    verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
+    # N=1 passes verdict=None -> parse internally (today's exact path). N>1 passes
+    # the merged verdict so the per-reviewer-labeled body is judged as a whole.
+    if verdict is None:
+        verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
 
@@ -1179,34 +1642,36 @@ def respond_code_review(
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
-    msg = f"Codex Reflector {prefix} [{file_path}]:\n{raw_output}"
+    msg = f"{label} Reflector {prefix} [{file_path}]:\n{raw_output}"
     result: dict = {"systemMessage": msg}
     # Inject into Claude context for FAIL/UNCERTAIN so agent can self-correct
     if verdict in ("FAIL", "UNCERTAIN"):
         result["hookSpecificOutput"] = {
             "hookEventName": event_name,
-            "additionalContext": f"Codex Review {prefix} [{file_path}]:\n{raw_output}",
+            "additionalContext": f"{label} Review {prefix} [{file_path}]:\n{raw_output}",
         }
     return result
 
 
-def respond_thinking(raw_output: str, event_name: str = "PostToolUse") -> dict:
+def respond_thinking(
+    raw_output: str, event_name: str = "PostToolUse", label: str = "Codex"
+) -> dict:
     if not raw_output:
         return {}
     return {
         "hookSpecificOutput": {
             "hookEventName": event_name,
-            "additionalContext": f"Codex Metacognition:\n{raw_output}",
+            "additionalContext": f"{label} Metacognition:\n{raw_output}",
         }
     }
 
 
 def respond_bash_failure(
-    raw_output: str, event_name: str = "PostToolUseFailure"
+    raw_output: str, event_name: str = "PostToolUseFailure", label: str = "Codex"
 ) -> dict:
     if not raw_output:
         return {}
-    msg = f"Codex Diagnostic:\n{raw_output}"
+    msg = f"{label} Diagnostic:\n{raw_output}"
     return {
         "systemMessage": msg,
         "hookSpecificOutput": {
@@ -1222,8 +1687,11 @@ def respond_plan_review(
     raw_output: str,
     cwd: str = "",
     event_name: str = "PostToolUse",
+    label: str = "Codex",
+    verdict: str | None = None,
 ) -> dict:
-    verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
+    if verdict is None:
+        verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
 
     if verdict == "FAIL":
@@ -1233,12 +1701,12 @@ def respond_plan_review(
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
-    msg = f"Codex Plan Review {prefix} [{plan_path}]:\n{raw_output}"
+    msg = f"{label} Plan Review {prefix} [{plan_path}]:\n{raw_output}"
     result: dict = {"systemMessage": msg}
     if verdict in ("FAIL", "UNCERTAIN"):
         result["hookSpecificOutput"] = {
             "hookEventName": event_name,
-            "additionalContext": f"Codex Plan Review {prefix} [{plan_path}]:\n{raw_output}",
+            "additionalContext": f"{label} Plan Review {prefix} [{plan_path}]:\n{raw_output}",
         }
     return result
 
@@ -1249,10 +1717,13 @@ def respond_subagent_review(
     raw_output: str,
     cwd: str = "",
     event_name: str = "SubagentStop",
+    label: str = "Codex",
+    verdict: str | None = None,
 ) -> dict:
     if not raw_output:
         return {}
-    verdict = parse_verdict(raw_output)
+    if verdict is None:
+        verdict = parse_verdict(raw_output)
     raw_output = _compact_output(raw_output, cwd)
 
     if verdict == "FAIL":
@@ -1262,13 +1733,40 @@ def respond_subagent_review(
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
-    msg = f"Codex Subagent Review {prefix}:\n{raw_output}"
+    msg = f"{label} Subagent Review {prefix}:\n{raw_output}"
     result: dict = {"systemMessage": msg}
     # SubagentStop doesn't support hookSpecificOutput — systemMessage only
     return result
 
 
-def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | None:
+def _compact_output_stop(text: str, cwd: str) -> str:
+    """Budget-capped compaction for the Stop reason (M-C / INV-STOP-DELIVERY).
+
+    Caps matryoshka to ONE layer (vs the default three) and guarantees a hard
+    <=_COMPACT_THRESHOLD truncation in every branch, so the Stop block is always
+    emittable inside the host wall-clock budget even if summarization is slow or
+    fails — preventing a computed block from being silently dropped past the
+    Stop kill (fail-closed inverting to fail-open).
+    """
+    if not text or len(text) <= _COMPACT_THRESHOLD:
+        return text
+    return _matryoshka_compact(
+        text, max_chars=_COMPACT_THRESHOLD, cwd=cwd, max_layers=1
+    )
+
+
+def respond_stop(
+    hook_data: dict,
+    cwd: str,
+    effort: str,
+    model: str,
+    backends: list[str] | None = None,
+    verdict: str | None = None,
+) -> dict | None:
+    if backends is None:
+        backends = ["codex"]
+    label = REVIEWER_LABEL(backends)
+
     # 1. Loop prevention
     if hook_data.get("stop_hook_active"):
         debug("stop_hook_active=true, approving stop")
@@ -1276,10 +1774,10 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
 
     session_id = hook_data.get("session_id", "")
 
-    # 2. Fast path: pending FAIL states (no codex needed)
+    # 2. Fast path: pending FAIL states (no reviewer needed)
     fails = _read_state(session_id)
     if fails:
-        reason = f"Unresolved Codex FAIL reviews:\n{format_fails(fails)}"
+        reason = f"Unresolved {label} FAIL reviews:\n{format_fails(fails)}"
         debug(f"blocking stop: {len(fails)} fails")
         return {"decision": "block", "reason": reason, "_exit": 2}
 
@@ -1295,32 +1793,40 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
         debug("no transcript available, approving stop")
         return None  # fail-open
 
-    # 4. Invoke codex for work review
+    # 4. Fan out the review to the reviewer set (N=1 short-circuits inline)
     prompt = build_stop_review_prompt(transcript, cwd=cwd)
-    raw_output = invoke_codex(prompt, cwd, effort, model)
+    results = fan_out(prompt, cwd, effort, model, backends)
+    raw_output = format_reviewer_blocks(results)
 
-    if not raw_output:
-        debug("codex returned empty, approving stop (fail-open)")
+    # 5. Merge verdicts (N=1 passes verdict=None -> parse internally as today).
+    # Empty survivor set -> approve (fail-open), matching today's empty-output.
+    if verdict is None:
+        merged = merge_verdicts(results)
+        if merged is MERGE_EMPTY:
+            debug("stop review empty (all infra-empty), approving stop (fail-open)")
+            return None
+        verdict = merged
+    elif not raw_output:
+        debug("stop review empty, approving stop (fail-open)")
         return None
 
-    # 5. Parse verdict from raw output, then compact for display
-    verdict = parse_verdict(raw_output)
-    raw_output = _compact_output(raw_output, cwd)
+    # 6. Parse done; compact for display under the Stop delivery budget (M-C)
+    raw_output = _compact_output_stop(raw_output, cwd)
     if verdict == "FAIL":
         return {
             "decision": "block",
-            "reason": f"Codex Stop Review FAIL:\n{raw_output}",
+            "reason": f"{label} Stop Review FAIL:\n{raw_output}",
             "_exit": 2,
         }
     if verdict == "PASS":
         return {
-            "systemMessage": f"Codex Stop Review PASS:\n{raw_output}",
+            "systemMessage": f"{label} Stop Review PASS:\n{raw_output}",
         }
     # UNCERTAIN: fail-closed — block
     debug("stop review UNCERTAIN, blocking (fail-closed)")
     return {
         "decision": "block",
-        "reason": f"Codex Stop Review UNCERTAIN:\n{raw_output}",
+        "reason": f"{label} Stop Review UNCERTAIN:\n{raw_output}",
         "_exit": 2,
     }
 
@@ -1633,6 +2139,580 @@ def run_self_test() -> None:
         if ok:
             all_passed += 1
 
+    # check() — local helper sharing the running total / OK-MISMATCH style.
+    def check(desc: str, got: object, expected: object) -> None:
+        nonlocal all_passed, all_total
+        ok = got == expected
+        status = "OK" if ok else "MISMATCH"
+        print(f"  {status}: {desc}: got={got!r:.80} expected={expected!r:.80}")
+        all_total += 1
+        if ok:
+            all_passed += 1
+
+    # Env save/restore so env-dependent sections never leak into later tests.
+    _override_vars = (
+        "REFLECTOR_MODEL",
+        "CODEX_REFLECTOR_MODEL",
+        "REFLECTOR_BACKENDS",
+        "REFLECTOR_BACKEND",
+        "CODEX_REFLECTOR_BACKEND",
+    )
+    _saved_env = {k: os.environ.get(k) for k in _override_vars}
+
+    def _clear_override_env() -> None:
+        for k in _override_vars:
+            os.environ.pop(k, None)
+
+    try:
+        # --- Codex argv byte-identity (M-D) ---
+        print("\n=== Codex Argv Byte-Identity ===")
+        _clear_override_env()
+        codex_default = [
+            "codex",
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--full-auto",
+            "--ephemeral",
+            "-c",
+            "model_reasoning_effort=medium",
+            "-m",
+            DEFAULT_MODEL,
+        ]
+        check("codex argv default", _codex_argv(DEFAULT_MODEL, "medium"), codex_default)
+        check(
+            "codex backend row argv (with -o)",
+            _build_backend_argv(BACKENDS["codex"], DEFAULT_MODEL, "medium", "/tmp/o.txt"),
+            codex_default + ["-o", "/tmp/o.txt"],
+        )
+        os.environ["CODEX_REFLECTOR_MODEL"] = "override-model"
+        check(
+            "codex argv honors CODEX_REFLECTOR_MODEL",
+            _codex_argv(DEFAULT_MODEL, "medium")[-1],
+            "override-model",
+        )
+        _clear_override_env()
+        check(
+            "LIGHTNING_FAST low -> high effort bump",
+            _codex_argv(LIGHTNING_FAST_MODEL, "low"),
+            [
+                "codex",
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "--full-auto",
+                "--ephemeral",
+                "-c",
+                "model_reasoning_effort=high",
+                "-m",
+                LIGHTNING_FAST_MODEL,
+            ],
+        )
+        check(
+            "LIGHTNING_FAST medium -> high effort bump",
+            "model_reasoning_effort=high" in _codex_argv(LIGHTNING_FAST_MODEL, "medium"),
+            True,
+        )
+
+        # --- Read-only levers + no write-enabling flags (INV-READONLY) ---
+        print("\n=== Read-Only Levers ===")
+        _clear_override_env()
+        forbidden = {
+            "--force",
+            "--yolo",
+            "--always-approve",
+            "--dangerously-skip-permissions",
+            "acceptEdits",
+            "bypassPermissions",
+        }
+        lever_expect = {
+            "codex": ["--sandbox", "read-only"],
+            "claude": ["--permission-mode", "plan"],
+            "cursor-agent": ["--mode", "plan"],
+            "grok": ["--permission-mode", "plan", "--sandbox", "read-only"],
+            "agy": ["--sandbox"],
+        }
+        for name, spec in BACKENDS.items():
+            argv = _build_backend_argv(spec, "", "medium", "/tmp/o.txt")
+            argv_str = " ".join(argv)
+            for lever in lever_expect[name]:
+                check(f"{name} argv contains read-only lever {lever!r}", lever in argv, True)
+            check(
+                f"{name} argv has no write-enabling flag",
+                any(f in argv_str for f in forbidden),
+                False,
+            )
+        check("grok sandbox is read-only (never strict)", "strict" in " ".join(
+            _build_backend_argv(BACKENDS["grok"], "", "medium", "")
+        ), False)
+        check("agy uses -p print mode", "-p" in BACKENDS["agy"].subcmd, True)
+        check("agy uses stdin=DEVNULL", BACKENDS["agy"].stdin_devnull, True)
+        check(
+            "cursor-agent lever is --mode plan, not --trust",
+            "--trust" in _build_backend_argv(BACKENDS["cursor-agent"], "", "medium", ""),
+            False,
+        )
+        # No non-codex backend may inherit the codex DEFAULT_MODEL (gpt-5.5): each
+        # CLI rejects an OpenAI model id. Guards the claude/cursor-agent regression.
+        for _name, _spec in BACKENDS.items():
+            if _name == "codex":
+                continue
+            check(
+                f"{_name} default_model is backend-native (not codex DEFAULT_MODEL)",
+                bool(_spec.default_model) and _spec.default_model != DEFAULT_MODEL,
+                True,
+            )
+
+        # --- resolve_backends precedence / dedupe / unknown-drop ---
+        print("\n=== resolve_backends ===")
+        resolve_cases = [
+            ({"REFLECTOR_BACKENDS": "codex,grok"}, ["codex", "grok"], "plural split"),
+            ({"REFLECTOR_BACKEND": "claude"}, ["claude"], "singular alias"),
+            ({"CODEX_REFLECTOR_BACKEND": "agy"}, ["agy"], "codex alias"),
+            (
+                {"REFLECTOR_BACKENDS": "grok", "REFLECTOR_BACKEND": "claude"},
+                ["grok"],
+                "plural wins over singular",
+            ),
+            (
+                {"REFLECTOR_BACKENDS": " Codex , GROK , codex "},
+                ["codex", "grok"],
+                "strip+lower+dedupe",
+            ),
+            ({"REFLECTOR_BACKENDS": "  ,  "}, ["codex"], "all-whitespace -> default"),
+            (
+                {"REFLECTOR_BACKENDS": "codex,nope,grok"},
+                ["codex", "grok"],
+                "unknown dropped, remainder kept",
+            ),
+            ({"REFLECTOR_BACKENDS": "nope,zzz"}, [], "all-unknown -> [] (fail-open)"),
+            ({}, ["codex"], "no env -> default codex"),
+        ]
+        for env, expected, desc in resolve_cases:
+            _clear_override_env()
+            os.environ.update(env)
+            check(f"resolve_backends {desc}", resolve_backends(), expected)
+        _clear_override_env()
+
+        # --- REVIEWER_LABEL ---
+        print("\n=== REVIEWER_LABEL ===")
+        check("REVIEWER_LABEL(['codex']) exact", REVIEWER_LABEL(["codex"]), "Codex")
+        check(
+            "REVIEWER_LABEL N>1 config-ordered join",
+            REVIEWER_LABEL(["codex", "claude"]),
+            "Codex+Claude",
+        )
+        check(
+            "REVIEWER_LABEL maps cursor-agent/grok/agy",
+            REVIEWER_LABEL(["grok", "agy", "cursor-agent"]),
+            "Grok+Antigravity+Cursor",
+        )
+        check("REVIEWER_LABEL empty -> Codex", REVIEWER_LABEL([]), "Codex")
+
+        # --- merge_verdicts lattice (INV-MERGE) ---
+        print("\n=== merge_verdicts ===")
+        merge_cases = [
+            ([("codex", "PASS")], "PASS", "single PASS"),
+            ([("codex", "FAIL"), ("grok", "PASS")], "FAIL", "any-FAIL dominates"),
+            (
+                [("codex", "PASS"), ("grok", "FAIL")],
+                "FAIL",
+                "per-reviewer parse (PASS+FAIL -> FAIL, not UNCERTAIN)",
+            ),
+            (
+                [("codex", "PASS"), ("grok", "no verdict here")],
+                "UNCERTAIN",
+                "UNCERTAIN over PASS",
+            ),
+            ([("codex", "PASS"), ("grok", "PASS")], "PASS", "all-PASS"),
+            (
+                [("codex", "PASS"), ("grok", "")],
+                "PASS",
+                "infra-empty EXCLUDED (not UNCERTAIN)",
+            ),
+        ]
+        for results, expected, desc in merge_cases:
+            check(f"merge_verdicts {desc}", merge_verdicts(results), expected)
+        check(
+            "merge_verdicts empty survivor set -> MERGE_EMPTY",
+            merge_verdicts([("codex", ""), ("grok", "")]) is MERGE_EMPTY,
+            True,
+        )
+        check(
+            "merge_verdicts no results -> MERGE_EMPTY",
+            merge_verdicts([]) is MERGE_EMPTY,
+            True,
+        )
+
+        # --- format_reviewer_blocks ---
+        print("\n=== format_reviewer_blocks ===")
+        check(
+            "single survivor verbatim (N=1 byte-identity)",
+            format_reviewer_blocks([("codex", "PASS body")]),
+            "PASS body",
+        )
+        _blocks = format_reviewer_blocks([("codex", "PASS\nx"), ("grok", "FAIL\ny")])
+        check("N>1 inline label [Codex: PASS]", "[Codex: PASS]" in _blocks, True)
+        check("N>1 inline label [Grok: FAIL]", "[Grok: FAIL]" in _blocks, True)
+        check(
+            "all infra-empty -> empty body",
+            format_reviewer_blocks([("codex", ""), ("grok", "")]),
+            "",
+        )
+
+        # --- fan_out N=1 inline == single invoke_backend (no executor) ---
+        print("\n=== fan_out ===")
+        _real_invoke = invoke_backend
+        _fan_calls: list[tuple] = []
+
+        def _stub_invoke(prompt, cwd, effort, model, backend):
+            _fan_calls.append((backend.bin, model, effort))
+            return f"PASS from {backend.bin}"
+
+        try:
+            globals()["invoke_backend"] = _stub_invoke
+            _fan_calls.clear()
+            n1 = fan_out("p", "/c", "medium", DEFAULT_MODEL, ["codex"])
+            check("fan_out N=1 returns one result", n1, [("codex", "PASS from codex")])
+            check(
+                "fan_out N=1 calls invoke_backend once with codex model",
+                _fan_calls,
+                [("codex", DEFAULT_MODEL, "medium")],
+            )
+            _fan_calls.clear()
+            n2 = fan_out("p", "/c", "high", "model-X", ["codex", "grok"])
+            check(
+                "fan_out N>1 collects in config order",
+                [name for name, _ in n2],
+                ["codex", "grok"],
+            )
+            _per = dict((b, (m, e)) for b, m, e in _fan_calls)
+            check(
+                "fan_out codex-scoped model (codex=model-X)",
+                _per["codex"],
+                ("model-X", "high"),
+            )
+            check(
+                "fan_out grok forced to default_model",
+                _per["grok"],
+                (BACKENDS["grok"].default_model, "high"),
+            )
+        finally:
+            globals()["invoke_backend"] = _real_invoke
+
+        # --- codex-scoped model override (KTD-4) via argv ---
+        print("\n=== Codex-Scoped Model Override ===")
+        _clear_override_env()
+        os.environ["REFLECTOR_MODEL"] = "X-model"
+        codex_argv_x = _build_backend_argv(
+            BACKENDS["codex"], DEFAULT_MODEL, "medium", "/tmp/o.txt"
+        )
+        check(
+            "codex member uses -m X-model under REFLECTOR_MODEL",
+            codex_argv_x[codex_argv_x.index("-m") + 1],
+            "X-model",
+        )
+        # grok: _backend_call_model forces default; override never reaches it.
+        grok_model = _backend_call_model("grok", BACKENDS["grok"], "X-model")
+        grok_argv_x = _build_backend_argv(BACKENDS["grok"], grok_model, "medium", "")
+        check(
+            "grok keeps default_model under REFLECTOR_MODEL",
+            BACKENDS["grok"].default_model in grok_argv_x and "X-model" not in grok_argv_x,
+            True,
+        )
+        # Summarizer stays FAST_MODEL, ignores both env vars.
+        os.environ["CODEX_REFLECTOR_MODEL"] = "Y-model"
+        summ_argv = _codex_argv(FAST_MODEL, "high", apply_override=False)
+        check(
+            "summarizer pinned to FAST_MODEL (ignores override env)",
+            summ_argv[summ_argv.index("-m") + 1],
+            FAST_MODEL,
+        )
+        _clear_override_env()
+
+        # --- _sandbox_content present in ALL untrusted-data build_*_prompt (m5) ---
+        # Audits every builder that interpolates attacker-controllable input — must
+        # iterate ALL of them (not a hand-picked subset) so a count mismatch (e.g.
+        # build_bash_failure_prompt sandboxed only response stdout/stderr) can't
+        # silently hide an unsandboxed prompt-injection hole.
+        print("\n=== Builder Sandbox-Content Audit ===")
+        builder_outputs = [
+            (
+                "build_code_review_prompt",
+                build_code_review_prompt(
+                    "Write", {"file_path": "x.py", "content": "print(1)"}, cwd=""
+                ),
+            ),
+            (
+                "build_thinking_prompt",
+                build_thinking_prompt("seqthink", {"thought": "t"}, cwd=""),
+            ),
+            (
+                "build_plan_review_prompt",
+                build_plan_review_prompt("plan body", "/p.md", cwd=""),
+            ),
+            (
+                "build_stop_review_prompt",
+                build_stop_review_prompt("transcript tail", cwd=""),
+            ),
+            (
+                "build_precompact_prompt",
+                build_precompact_prompt("transcript tail", cwd=""),
+            ),
+            (
+                # No tool_response: proves the sandbox wraps an always-present field
+                # (the command/error), not just the optional stdout/stderr — the
+                # exact gap that scoped this audit to 5 builders before.
+                "build_bash_failure_prompt",
+                build_bash_failure_prompt(
+                    {"command": "make build"}, "exit 1: boom", cwd=""
+                ),
+            ),
+            (
+                "build_code_change_failure_prompt",
+                build_code_change_failure_prompt(
+                    "mcp__edit__edit_file",
+                    {"file_path": "x.py", "code_edit": "...", "instruction": "do"},
+                    "apply failed",
+                    cwd="",
+                ),
+            ),
+            (
+                "build_subagent_review_prompt",
+                build_subagent_review_prompt("explorer", "subagent transcript", cwd=""),
+            ),
+        ]
+        for fn_name, out in builder_outputs:
+            check(
+                f"{fn_name} wraps untrusted data in sandbox tags",
+                "<untrusted-data label=" in out,
+                True,
+            )
+
+        # --- invoke_backend real-path dispatch (reviewer execution; MAJOR 3/5) ---
+        # Exercises the actual invoke_backend body (not a stub) with subprocess.run
+        # monkeypatched to a recording stub: prompt-delivery branches, capture
+        # selection, the codex trailing '-' / '-o <tmp>' append (INV-CODEX-PATH-
+        # STABLE end-to-end), the grok --prompt-file threshold spill + temp unlink,
+        # and agy stdin=DEVNULL. subprocess.run is looked up at call time, so
+        # patching the module attribute reaches the running code.
+        print("\n=== invoke_backend Dispatch ===")
+
+        class _Recorder:
+            """Captures the most recent subprocess.run(...) call."""
+
+            def __init__(self) -> None:
+                self.argv: list[str] = []
+                self.kwargs: dict = {}
+
+            def __call__(self, argv, **kwargs):
+                self.argv = list(argv)
+                self.kwargs = kwargs
+
+                class _Proc:
+                    stdout = "PASS\nrecorded stub output"
+                    stderr = ""
+                    returncode = 0
+
+                return _Proc()
+
+        _rec = _Recorder()
+        _real_run = subprocess.run
+        try:
+            subprocess.run = _rec  # type: ignore[assignment]
+
+            # codex: full reviewer argv == _codex_argv(...) + ['-o', <tmp>, '-'].
+            # The tmp path is unpredictable, so assert the prefix and the trailing
+            # three tokens (the '-' is what no prior test reached).
+            invoke_backend("the prompt", "/c", "medium", DEFAULT_MODEL, BACKENDS["codex"])
+            _prefix = _codex_argv(DEFAULT_MODEL, "medium")
+            check(
+                "codex reviewer argv prefix matches _codex_argv",
+                _rec.argv[: len(_prefix)],
+                _prefix,
+            )
+            check(
+                "codex reviewer argv appends -o <tmp> - (stdin delivery)",
+                (_rec.argv[-3], _rec.argv[-1]),
+                ("-o", "-"),
+            )
+            check(
+                "codex reviewer runs under spec timeout (==100)",
+                _rec.kwargs.get("timeout"),
+                100,
+            )
+            check("BACKENDS['codex'].timeout == 100", BACKENDS["codex"].timeout, 100)
+
+            # grok below threshold -> ['--single', <prompt>] inline.
+            invoke_backend(
+                "short prompt", "/c", "medium", "grok-code-fast-1", BACKENDS["grok"]
+            )
+            check(
+                "grok below threshold uses --single inline",
+                "--single" in _rec.argv
+                and _rec.argv[_rec.argv.index("--single") + 1] == "short prompt"
+                and "--prompt-file" not in _rec.argv,
+                True,
+            )
+
+            # grok at/over threshold -> ['--prompt-file', <path>]; temp unlinked.
+            _big = "x" * BACKENDS["grok"].prompt_file_threshold
+            invoke_backend(_big, "/c", "medium", "grok-code-fast-1", BACKENDS["grok"])
+            check(
+                "grok >= threshold spills to --prompt-file",
+                "--prompt-file" in _rec.argv and "--single" not in _rec.argv,
+                True,
+            )
+            _pf_path = _rec.argv[_rec.argv.index("--prompt-file") + 1]
+            check(
+                "grok prompt-file temp removed in finally",
+                os.path.exists(_pf_path),
+                False,
+            )
+
+            # agy: stdin=DEVNULL, no run_input, positional prompt.
+            invoke_backend("agy prompt", "/c", "medium", "gemini-3-pro", BACKENDS["agy"])
+            check(
+                "agy passes stdin=DEVNULL",
+                _rec.kwargs.get("stdin"),
+                subprocess.DEVNULL,
+            )
+            check("agy passes no stdin input", _rec.kwargs.get("input"), None)
+            check(
+                "agy delivers prompt positionally",
+                "agy prompt" in _rec.argv,
+                True,
+            )
+        finally:
+            subprocess.run = _real_run  # type: ignore[assignment]
+
+        # --- responder verdict state machine (UNCERTAIN preserves prior FAIL; MAJOR 4) ---
+        # Named invariant (CLAUDE.md "UNCERTAIN preserves prior state"; plan
+        # Named-invariants "UNCERTAIN preserves prior FAIL"). The merge lattice
+        # tests prove merge_verdicts returns UNCERTAIN, but nothing else proves the
+        # responder then LEAVES a previously-written FAIL state intact. Flipping the
+        # responder's UNCERTAIN branch to clear state would otherwise pass the suite.
+        print("\n=== Responder Verdict State Machine ===")
+        _sid = "u5-state"
+        _fp = "state_machine.py"
+        try:
+            # FAIL writes state.
+            respond_code_review(
+                _sid, "Write", {"file_path": _fp}, "FAIL\nbad", cwd="", verdict="FAIL"
+            )
+            check(
+                "respond_code_review FAIL writes fail-state",
+                any(e.get("file_path") == _fp for e in _read_state(_sid)),
+                True,
+            )
+            # UNCERTAIN is a no-op: the prior FAIL must survive.
+            respond_code_review(
+                _sid, "Write", {"file_path": _fp}, "no verdict", cwd="", verdict="UNCERTAIN"
+            )
+            check(
+                "respond_code_review UNCERTAIN preserves prior FAIL",
+                any(e.get("file_path") == _fp for e in _read_state(_sid)),
+                True,
+            )
+            # PASS clears the FAIL.
+            respond_code_review(
+                _sid, "Write", {"file_path": _fp}, "PASS", cwd="", verdict="PASS"
+            )
+            check(
+                "respond_code_review PASS clears fail-state",
+                any(e.get("file_path") == _fp for e in _read_state(_sid)),
+                False,
+            )
+            # respond_plan_review honors the same lattice on its own key.
+            _pp = "/plan/state.md"
+            respond_plan_review(_sid, _pp, "FAIL\nbad", cwd="", verdict="FAIL")
+            respond_plan_review(_sid, _pp, "no verdict", cwd="", verdict="UNCERTAIN")
+            check(
+                "respond_plan_review UNCERTAIN preserves prior FAIL",
+                any(e.get("file_path") == _pp for e in _read_state(_sid)),
+                True,
+            )
+        finally:
+            clear_fail_state(_sid, _fp)
+            clear_fail_state(_sid, "/plan/state.md")
+
+        # --- Stop delivery budget (_compact_output_stop; INV-STOP-DELIVERY / MAJOR 6) ---
+        # The 1-layer cap and the unconditional <=_COMPACT_THRESHOLD ceiling are the
+        # M-C invariant. A regression restoring the 3-layer default or dropping the
+        # truncation guarantee would silently re-introduce the fail-closed -> fail-
+        # open Stop-drop while the suite stays green.
+        print("\n=== Stop Delivery Budget ===")
+        check(
+            "_compact_output_stop passes through below threshold",
+            _compact_output_stop("short stop reason", ""),
+            "short stop reason",
+        )
+        # Over-threshold + invoke_codex stubbed to "" forces matryoshka fail-open,
+        # which truncates to max_chars. Deterministic (no spawn dependence on cwd).
+        _real_invoke_codex = invoke_codex
+        _layers_seen: list[int] = []
+        _real_matryoshka = _matryoshka_compact
+
+        def _stub_invoke_codex(prompt, cwd, effort="medium", model=""):
+            return ""  # force matryoshka fail-open truncation
+
+        def _recording_matryoshka(text, max_chars=MAX_COMPACT_CHARS, cwd="", max_layers=3):
+            _layers_seen.append(max_layers)
+            return _real_matryoshka(text, max_chars=max_chars, cwd=cwd, max_layers=max_layers)
+
+        try:
+            globals()["invoke_codex"] = _stub_invoke_codex
+            _over = "y" * (_COMPACT_THRESHOLD * 3)
+            _capped = _compact_output_stop(_over, "/some/cwd")
+            check(
+                "_compact_output_stop hard-truncates to <=_COMPACT_THRESHOLD",
+                len(_capped) <= _COMPACT_THRESHOLD,
+                True,
+            )
+            globals()["_matryoshka_compact"] = _recording_matryoshka
+            _layers_seen.clear()
+            _compact_output_stop(_over, "/some/cwd")
+            check(
+                "_compact_output_stop caps matryoshka to one layer",
+                _layers_seen,
+                [1],
+            )
+        finally:
+            globals()["invoke_codex"] = _real_invoke_codex
+            globals()["_matryoshka_compact"] = _real_matryoshka
+
+        # --- empty survivor set approves Stop (INV-MERGE / fail-open) ---
+        print("\n=== Stop Empty-Set Behavior ===")
+
+        def _stub_empty(prompt, cwd, effort, model, backend):
+            return ""  # all reviewers infra-empty
+
+        try:
+            globals()["invoke_backend"] = _stub_empty
+            stop_data = {
+                "session_id": "u5-empty",
+                "last_assistant_message": "did some work",
+            }
+            check(
+                "Stop with all-empty reviewers returns None (approve)",
+                respond_stop(
+                    stop_data, "", "medium", DEFAULT_MODEL, backends=["codex", "grok"]
+                ),
+                None,
+            )
+        finally:
+            globals()["invoke_backend"] = _real_invoke
+            clear_fail_state("u5-empty", "did some work")
+    finally:
+        # Restore env exactly as it was.
+        for k, v in _saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
     print(f"\n{all_passed}/{all_total} passed")
     sys.exit(0 if all_passed == all_total else 1)
 
@@ -1663,14 +2743,26 @@ def main() -> None:
     cwd = hook_data.get("cwd", os.getcwd())
     session_id = hook_data.get("session_id", "")
 
-    debug(f"event={event} tool={hook_data.get('tool_name', 'N/A')}")
+    # Resolve the reviewer set ONCE (KTD-2). Default ["codex"] -> N=1 short-circuit
+    # (INV-CODEX-PATH-STABLE). All-unknown -> [] -> fail-open no-op (exit 0).
+    backends = resolve_backends()
+    if not backends:
+        debug("no recognized reviewer backends, fail-open exit 0")
+        sys.exit(0)
+    label = REVIEWER_LABEL(backends)
+
+    debug(f"event={event} tool={hook_data.get('tool_name', 'N/A')} backends={backends}")
 
     # Route by event
     result: dict | None = None
 
     if event == "Stop":
         result = respond_stop(
-            hook_data, cwd, _ME_STOP_REVIEW.effort, _ME_STOP_REVIEW.model
+            hook_data,
+            cwd,
+            _ME_STOP_REVIEW.effort,
+            _ME_STOP_REVIEW.model,
+            backends=backends,
         )
 
     # elif event == "SubagentStop":
@@ -1705,13 +2797,25 @@ def main() -> None:
 
         tool_response = hook_data.get("tool_response", {})
 
+        # N>1 passes the merged verdict; N=1 passes None so responders parse
+        # internally (today's exact path). Verdict-bearing categories only.
+        def merged_verdict(results: list[tuple[str, str]]) -> str | None:
+            return merge_verdicts(results) if len(backends) > 1 else None
+
         if category == "code_change":
             prompt = build_code_review_prompt(
                 tool_name, tool_input, cwd=cwd, tool_response=tool_response
             )
-            raw = invoke_codex(prompt, cwd, effort, model)
+            results = fan_out(prompt, cwd, effort, model, backends)
             result = respond_code_review(
-                session_id, tool_name, tool_input, raw, cwd=cwd, event_name=event
+                session_id,
+                tool_name,
+                tool_input,
+                format_reviewer_blocks(results),
+                cwd=cwd,
+                event_name=event,
+                label=label,
+                verdict=merged_verdict(results),
             )
         elif category == "plan_review":
             plan = _find_plan_for_session(hook_data)
@@ -1719,27 +2823,42 @@ def main() -> None:
                 sys.exit(0)
             plan_path, plan_content = plan
             prompt = build_plan_review_prompt(plan_content, plan_path, cwd=cwd)
-            raw = invoke_codex(prompt, cwd, effort, model)
+            results = fan_out(prompt, cwd, effort, model, backends)
             result = respond_plan_review(
-                session_id, plan_path, raw, cwd=cwd, event_name=event
+                session_id,
+                plan_path,
+                format_reviewer_blocks(results),
+                cwd=cwd,
+                event_name=event,
+                label=label,
+                verdict=merged_verdict(results),
             )
         elif category == "thinking":
+            # Text-only category: concatenate labeled blocks, no merge/state.
             prompt = build_thinking_prompt(tool_name, tool_input, cwd=cwd)
-            raw = invoke_codex(prompt, cwd, effort, model)
-            result = respond_thinking(raw, event_name=event)
+            results = fan_out(prompt, cwd, effort, model, backends)
+            result = respond_thinking(
+                format_reviewer_blocks(results), event_name=event, label=label
+            )
         elif category == "bash_failure":
+            # Text-only category: concatenate labeled blocks, no merge/state.
             prompt = build_bash_failure_prompt(
                 tool_input, error, tool_response=tool_response, cwd=cwd
             )
-            raw = invoke_codex(prompt, cwd, effort, model)
-            result = respond_bash_failure(raw, event_name=event)
+            results = fan_out(prompt, cwd, effort, model, backends)
+            result = respond_bash_failure(
+                format_reviewer_blocks(results), event_name=event, label=label
+            )
         elif category == "code_change_failure":
+            # Text-only category: concatenate labeled blocks, no merge/state.
             prompt = build_code_change_failure_prompt(
                 tool_name, tool_input, error, tool_response=tool_response, cwd=cwd
             )
-            raw = invoke_codex(prompt, cwd, effort, model)
+            results = fan_out(prompt, cwd, effort, model, backends)
             # Reuse respond_bash_failure — same diagnostic-only shape, no FAIL cache.
-            result = respond_bash_failure(raw, event_name=event)
+            result = respond_bash_failure(
+                format_reviewer_blocks(results), event_name=event, label=label
+            )
 
     else:
         debug(f"unhandled event: {event}")
