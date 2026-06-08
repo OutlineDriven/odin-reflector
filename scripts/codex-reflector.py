@@ -1612,21 +1612,42 @@ Focus on what the agent should correct or reinforce going forward."""
 # ---------------------------------------------------------------------------
 
 
-def _state_path(session_id: str) -> Path:
+# Hosts whose fail-state file keeps the BARE, un-namespaced filename
+# `codex-reflector-fails-{session_id}.json` (INV-CODEX-PATH-STABLE / B5).
+# claude+codex are the protected default; cursor is already shipped against the
+# bare filename, so namespacing it now would silently orphan in-flight Cursor
+# state. Reuse _IDENTITY_HOSTS as the single source of truth so the bare set and
+# the identity-renderer set can never drift. Every OTHER host (antigravity U11,
+# grok U10) is namespaced as `codex-reflector-fails-{host}-{session_id}.json` so
+# concurrent sessions on different hosts can never collide on one /tmp file.
+# NOTE: _IDENTITY_HOSTS is defined later (host seam section); referenced lazily
+# inside _state_path at call time, never at import, so order is irrelevant.
+DEFAULT_STATE_HOST = "claude"
+
+
+def _state_path(session_id: str, host: str = DEFAULT_STATE_HOST) -> Path:
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
-    return STATE_DIR / f"codex-reflector-fails-{safe}.json"
+    # Default/identity hosts (claude/codex/cursor) keep the byte-identical bare
+    # filename; only non-default hosts get the `-{host}-` discriminator (B5).
+    if host in _IDENTITY_HOSTS:
+        return STATE_DIR / f"codex-reflector-fails-{safe}.json"
+    safe_host = re.sub(r"[^a-zA-Z0-9_-]", "_", host)
+    return STATE_DIR / f"codex-reflector-fails-{safe_host}-{safe}.json"
 
 
 def _atomic_update_state(
     session_id: str,
     updater: Callable[[list[dict]], list[dict] | None],
+    host: str = DEFAULT_STATE_HOST,
 ) -> list[dict]:
     """Atomically read-modify-write state under exclusive lock.
     updater receives current entries, returns new entries or None (no change).
+    `host` selects the (possibly namespaced) state file (B5); default keeps the
+    bare filename byte-identical (INV-CODEX-PATH-STABLE).
     """
     if not session_id:
         return []
-    path = _state_path(session_id)
+    path = _state_path(session_id, host)
     if not path.exists():
         path.touch(mode=0o600)
     with open(path, "r+") as f:
@@ -1648,11 +1669,11 @@ def _atomic_update_state(
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def _read_state(session_id: str) -> list[dict]:
-    """Read state (read-only, shared lock)."""
+def _read_state(session_id: str, host: str = DEFAULT_STATE_HOST) -> list[dict]:
+    """Read state (read-only, shared lock). `host` selects the state file (B5)."""
     if not session_id:
         return []
-    path = _state_path(session_id)
+    path = _state_path(session_id, host)
     if not path.exists():
         return []
     try:
@@ -1667,7 +1688,11 @@ def _read_state(session_id: str) -> list[dict]:
 
 
 def write_fail_state(
-    session_id: str, tool_name: str, file_path: str, feedback: str
+    session_id: str,
+    tool_name: str,
+    file_path: str,
+    feedback: str,
+    host: str = DEFAULT_STATE_HOST,
 ) -> None:
     def updater(entries: list[dict]) -> list[dict]:
         filtered = [e for e in entries if e.get("file_path") != file_path]
@@ -1680,15 +1705,17 @@ def write_fail_state(
         )
         return filtered
 
-    _atomic_update_state(session_id, updater)
+    _atomic_update_state(session_id, updater, host)
 
 
-def clear_fail_state(session_id: str, file_path: str) -> None:
+def clear_fail_state(
+    session_id: str, file_path: str, host: str = DEFAULT_STATE_HOST
+) -> None:
     def updater(entries: list[dict]) -> list[dict] | None:
         filtered = [e for e in entries if e.get("file_path") != file_path]
         return filtered if len(filtered) != len(entries) else None
 
-    _atomic_update_state(session_id, updater)
+    _atomic_update_state(session_id, updater, host)
 
 
 def format_fails(entries: list[dict]) -> str:
@@ -1813,6 +1840,7 @@ def respond_code_review(
     event_name: str = "PostToolUse",
     label: str = "Codex",
     verdict: str | None = None,
+    host: str = DEFAULT_STATE_HOST,
 ) -> dict:
     # N=1 passes verdict=None -> parse internally (today's exact path). N>1 passes
     # the merged verdict so the per-reviewer-labeled body is judged as a whole.
@@ -1822,9 +1850,9 @@ def respond_code_review(
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
 
     if verdict == "FAIL":
-        write_fail_state(session_id, tool_name, file_path, raw_output)
+        write_fail_state(session_id, tool_name, file_path, raw_output, host)
     elif verdict == "PASS":
-        clear_fail_state(session_id, file_path)
+        clear_fail_state(session_id, file_path, host)
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
@@ -1875,15 +1903,16 @@ def respond_plan_review(
     event_name: str = "PostToolUse",
     label: str = "Codex",
     verdict: str | None = None,
+    host: str = DEFAULT_STATE_HOST,
 ) -> dict:
     if verdict is None:
         verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
 
     if verdict == "FAIL":
-        write_fail_state(session_id, "ExitPlanMode", plan_path, raw_output)
+        write_fail_state(session_id, "ExitPlanMode", plan_path, raw_output, host)
     elif verdict == "PASS":
-        clear_fail_state(session_id, plan_path)
+        clear_fail_state(session_id, plan_path, host)
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
@@ -1905,6 +1934,7 @@ def respond_subagent_review(
     event_name: str = "SubagentStop",
     label: str = "Codex",
     verdict: str | None = None,
+    host: str = DEFAULT_STATE_HOST,
 ) -> dict:
     if not raw_output:
         return {}
@@ -1913,9 +1943,9 @@ def respond_subagent_review(
     raw_output = _compact_output(raw_output, cwd)
 
     if verdict == "FAIL":
-        write_fail_state(session_id, "SubagentStop", agent_type, raw_output)
+        write_fail_state(session_id, "SubagentStop", agent_type, raw_output, host)
     elif verdict == "PASS":
-        clear_fail_state(session_id, agent_type)
+        clear_fail_state(session_id, agent_type, host)
     # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
@@ -1948,6 +1978,7 @@ def respond_stop(
     model: str,
     backends: list[str] | None = None,
     verdict: str | None = None,
+    host: str = DEFAULT_STATE_HOST,
 ) -> dict | None:
     if backends is None:
         backends = ["codex"]
@@ -1960,8 +1991,12 @@ def respond_stop(
 
     session_id = hook_data.get("session_id", "")
 
-    # 2. Fast path: pending FAIL states (no reviewer needed)
-    fails = _read_state(session_id)
+    # 2. Fast path: pending FAIL states (no reviewer needed). `host` MUST match
+    # the host the FAILs were written under at PostToolUse, else they read from
+    # the wrong namespace and never surface (B5). Antigravity's installer +
+    # hooks.json pin REFLECTOR_HOST so write/read agree even when the Stop
+    # payload lacks the workspacePaths that would otherwise infer the host.
+    fails = _read_state(session_id, host)
     if fails:
         reason = f"Unresolved {label} FAIL reviews:\n{format_fails(fails)}"
         debug(f"blocking stop: {len(fails)} fails")
@@ -2272,6 +2307,109 @@ def _normalize_grok_input(hook_data: dict) -> dict:
         sid = hook_data.get("sessionId") or hook_data.get("conversationId")
         if sid:
             hook_data["session_id"] = sid
+    return hook_data
+
+
+# ---------------------------------------------------------------------------
+# Antigravity host normalizer (U11 / B4 / KTD-10)
+# ---------------------------------------------------------------------------
+#
+# Antigravity (agy 1.0.6) fires native JSON hooks gated by the user setting
+# `enable_json_hooks`. Its payload diverges from Claude's PascalCase scheme:
+#   conversationId   -> session_id   (so the existing /tmp fail-state flow needs
+#                                      NO change — m4; host parity is pinned by
+#                                      REFLECTOR_HOST, see install-antigravity.sh)
+#   workspacePaths[0]-> cwd
+#   transcriptPath   -> transcript_path (Stop holistic review)
+#   error            -> re-emit as PostToolUseFailure (B4) so a failed tool call
+#                       routes to the bash_failure / code_change_failure path
+#                       instead of being reviewed as a successful edit.
+# Tool names differ entirely (run_command / write_to_file / replace_file_content
+# / view_file / ...) and are remapped to the matchers classify() expects.
+#
+# FIRING-GATE CAVEAT (KTD-10 — these field/tool strings are the DESIGN, gated):
+#   (a) hooks must actually fire under `agy -p` with enable_json_hooks set;
+#   (b) Stop `decision:"continue"+reason` must re-inject `reason` as actionable
+#       feedback (UNCONFIRMED — if it does not, agy degrades to advisory-only:
+#       the FAIL still records to fail-state and the Stop systemMessage shows it,
+#       but the agent is not steered);
+#   (c) PreToolUse deny support is UNVERIFIED (no pre-edit block on agy yet).
+# The exact event-name / key casing below is the documented assumption; gate (a)
+# confirms it. Constants are isolated so a casing correction is a one-line edit.
+
+# Antigravity event-name map -> Claude PascalCase. Antigravity is assumed to use
+# Claude-style PascalCase event names already (binary-confirmed native hooks are
+# a near-clone). Mapped defensively so a camelCase variant is still routed; the
+# identity entries make a PascalCase payload a no-op.
+_ANTIGRAVITY_EVENT_MAP = {
+    "preToolUse": "PreToolUse",
+    "postToolUse": "PostToolUse",
+    "postToolUseFailure": "PostToolUseFailure",
+    "stop": "Stop",
+    "preCompact": "PreCompact",
+    "PreToolUse": "PreToolUse",
+    "PostToolUse": "PostToolUse",
+    "PostToolUseFailure": "PostToolUseFailure",
+    "Stop": "Stop",
+    "PreCompact": "PreCompact",
+}
+
+# Antigravity tool name -> Claude matcher classify() routes on. run_command is a
+# shell exec (Bash); write_to_file creates/overwrites a file (Write);
+# replace_file_content is a targeted edit (Edit); view_file is a read (Read, a
+# _SKIP_TOOLS no-op so it fast-exits). Unknown names pass through unchanged so a
+# genuinely new edit tool is not silently dropped (classify falls to its skip).
+_ANTIGRAVITY_TOOL_MAP = {
+    "run_command": "Bash",
+    "write_to_file": "Write",
+    "replace_file_content": "Edit",
+    "edit_file": "Edit",
+    "view_file": "Read",
+    "read_file": "Read",
+    "list_dir": "Glob",
+    "grep_search": "Grep",
+    "find_by_name": "Glob",
+}
+
+
+def _normalize_antigravity_input(hook_data: dict) -> dict:
+    """Map Antigravity-shaped hook payloads into Claude-shaped routing fields (U11).
+
+    conversationId -> session_id, workspacePaths[0] -> cwd, transcriptPath ->
+    transcript_path, error -> re-emit PostToolUseFailure (B4), and tool-name
+    remap so classify() matches. Mutates and returns hook_data in place (same
+    contract as _normalize_cursor_input).
+    """
+    event = hook_data.get("hook_event_name")
+    if event in _ANTIGRAVITY_EVENT_MAP:
+        hook_data["hook_event_name"] = _ANTIGRAVITY_EVENT_MAP[event]
+
+    if "conversationId" in hook_data and "session_id" not in hook_data:
+        hook_data["session_id"] = hook_data["conversationId"]
+
+    if "workspacePaths" in hook_data and not hook_data.get("cwd"):
+        paths = hook_data.get("workspacePaths") or []
+        if paths:
+            hook_data["cwd"] = paths[0]
+
+    if "transcriptPath" in hook_data and "transcript_path" not in hook_data:
+        hook_data["transcript_path"] = hook_data["transcriptPath"]
+
+    # B4: an `error` (or non-empty errorMessage) on a PostToolUse payload means
+    # the tool call FAILED — re-emit it as PostToolUseFailure so it routes to the
+    # diagnostic path, not a (misleading) successful-edit review. Done BEFORE the
+    # tool-name remap so the failure routes on the Claude-mapped tool name.
+    err = hook_data.get("error") or hook_data.get("errorMessage")
+    if err and hook_data.get("hook_event_name") == "PostToolUse":
+        hook_data["hook_event_name"] = "PostToolUseFailure"
+        if "error" not in hook_data:
+            hook_data["error"] = err
+
+    # Tool-name remap (after the failure re-emit so a failed run_command lands as
+    # a Bash bash_failure). Unmapped names are left as-is for classify() to skip.
+    tool_name = hook_data.get("tool_name")
+    if tool_name in _ANTIGRAVITY_TOOL_MAP:
+        hook_data["tool_name"] = _ANTIGRAVITY_TOOL_MAP[tool_name]
 
     return hook_data
 
@@ -2467,22 +2605,92 @@ def _render_identity_output(
     return payload, exit_code
 
 
+def _render_antigravity_output(
+    canonical: Canonical, event: str
+) -> tuple[dict | None, int]:
+    """Antigravity renderer (U11) — Stop-centric, PostToolUse cannot inject.
+
+    Antigravity's surfacing model differs from Claude's:
+      * PostToolUse output CANNOT inject context (agy returns {}), so this maps
+        EVERY non-Stop event to ({}, 0): nothing is steered inline. The review
+        still ran and any FAIL was already recorded to fail-state by the
+        responder upstream (this renderer NEVER writes state — it only shapes
+        the wire output), so the FAIL is not lost — it surfaces at Stop.
+      * Stop is the single surfacing point: a blocking Stop result (accumulated
+        FAILs / UNCERTAIN) is delivered as exit-0 stdout `decision:"continue"` +
+        `reason` carrying the accumulated FAILs. The `reason` is rebuilt fresh
+        from `canonical.reason` and the responder's `_exit:2` is DROPPED — if it
+        were propagated, main()'s output boundary would take the stderr/exit-2
+        branch and the decision:continue JSON would never reach stdout.
+      * A non-blocking Stop (PASS) carries only a user-facing systemMessage.
+
+    FIRING-GATE (b) CAVEAT (KTD-10): Stop re-injection of `reason` as actionable
+    feedback is UNCONFIRMED. If gate (b) fails, this is the advisory-only
+    fallback — the `reason`/`systemMessage` is still emitted (visible to the
+    user), the FAIL is still in fail-state, but the agent is not steered.
+    """
+    if event == "PreToolUse":
+        # PreToolUse deny support on agy is UNVERIFIED (gate (c), KTD-10): there
+        # is no confirmed permissionDecision channel, so a deny CANNOT be
+        # enforced as a hard block here. But never SILENTLY drop a safety block
+        # (allow-by-omission). When the responder produced a deny, surface its
+        # reason as a visible systemMessage + debug so the attempted block is
+        # auditable; the edit still proceeds (agy limitation, documented).
+        if canonical.permission_decision == "deny":
+            reason = (
+                canonical.permission_decision_reason
+                or canonical.reason
+                or canonical.systemMessage
+                or "pre-edit review flagged this edit"
+            )
+            debug(
+                "antigravity: PreToolUse deny cannot be enforced (gate (c) "
+                "unverified); surfacing advisory systemMessage instead"
+            )
+            return {
+                "systemMessage": (
+                    f"[advisory — agy cannot block pre-edit] {reason}"
+                )
+            }, 0
+        # Quiet allow (None/empty) -> nothing.
+        return {}, 0
+
+    if event != "Stop":
+        # PostToolUse / PostToolUseFailure / PreCompact: agy cannot inject
+        # context. Emit {} so main() prints an empty object (the review ran; any
+        # FAIL is in fail-state and surfaces at Stop). These events never carry a
+        # hard block (respond_* never blocks on PostToolUse), so {} is correct.
+        return {}, 0
+
+    # Stop. A blocking result (FAIL/UNCERTAIN accumulation) re-injects via
+    # decision:"continue" + reason at exit 0. Non-blocking (PASS) -> systemMessage.
+    if canonical.blocking:
+        reason = canonical.reason or canonical.systemMessage or ""
+        return {"decision": "continue", "reason": reason}, 0
+    if canonical.raw:
+        # PASS / advisory Stop: surface the user-facing message, no steering.
+        msg = canonical.systemMessage or canonical.reason
+        if msg:
+            return {"systemMessage": msg}, 0
+    return {}, 0
+
+
 def _render_host_output(
     host: str, result: dict | None, event: str
 ) -> tuple[dict | None, int]:
     """Route a responder result through the per-host output renderer (U7/KTD-7).
 
     claude/codex/cursor share the identity renderer (byte-identical default
-    path). grok (U10) and antigravity (U11) get dedicated renderers that build
-    from the canonical structured fields; until then they fall back to identity
-    so the host axis degrades to Claude-shaped output rather than dropping a
-    review. The canonical lift happens here so every host sees the same schema.
+    path). antigravity (U11) gets a dedicated Stop-centric renderer. grok (U10)
+    falls back to identity until its renderer lands so the host axis degrades to
+    Claude-shaped output rather than dropping a review. The canonical lift
+    happens here so every host sees the same schema.
     """
     canonical = _to_canonical(result, event)
     if host == "grok":
         return _render_grok_output(canonical, event)
-    # antigravity renderer lands in U11. Clean extension point:
-    #   if host == "antigravity": return _render_antigravity_output(canonical, event)
+    if host == "antigravity":
+        return _render_antigravity_output(canonical, event)
     return _render_identity_output(canonical, event)
 
 
@@ -2542,7 +2750,7 @@ def _normalize_input(host: str, hook_data: dict) -> dict:
     if host == "grok":
         return _normalize_grok_input(hook_data)
     if host == "antigravity":
-        debug(f"no {host} input normalizer yet (U11); identity passthrough")
+        return _normalize_antigravity_input(hook_data)
     return hook_data
 
 
@@ -4138,6 +4346,260 @@ def run_self_test() -> None:
         finally:
             STATE_DIR = _saved_state_dir
             shutil.rmtree(_tmp_state, ignore_errors=True)
+
+        # --- Antigravity host: input normalizer (U11 / B4) ---
+        print("\n=== Antigravity Host: Input Normalizer ===")
+        # conversationId -> session_id; workspacePaths[0] -> cwd; transcriptPath
+        # -> transcript_path; PostToolUse write_to_file -> Write.
+        _agy_post = _normalize_antigravity_input(
+            {
+                "hook_event_name": "PostToolUse",
+                "conversationId": "agy-conv-1",
+                "workspacePaths": ["/repo/a", "/repo/b"],
+                "tool_name": "write_to_file",
+                "tool_input": {"file_path": "x.py", "content": "y = 1"},
+            }
+        )
+        check(
+            "antigravity conversationId -> session_id",
+            _agy_post.get("session_id"),
+            "agy-conv-1",
+        )
+        check(
+            "antigravity workspacePaths[0] -> cwd",
+            _agy_post.get("cwd"),
+            "/repo/a",
+        )
+        check(
+            "antigravity write_to_file -> Write",
+            _agy_post.get("tool_name"),
+            "Write",
+        )
+        check(
+            "antigravity write_to_file classifies to code_change",
+            (
+                classify(
+                    _agy_post.get("tool_name", ""),
+                    _agy_post.get("hook_event_name", ""),
+                    _agy_post.get("tool_input", {}),
+                )
+                or (None,)
+            )[0],
+            "code_change",
+        )
+        # Tool-name remap table: run_command->Bash, replace_file_content->Edit,
+        # view_file->Read.
+        for _agy_tool, _claude_tool in (
+            ("run_command", "Bash"),
+            ("replace_file_content", "Edit"),
+            ("view_file", "Read"),
+        ):
+            _n = _normalize_antigravity_input(
+                {"hook_event_name": "PostToolUse", "tool_name": _agy_tool}
+            )
+            check(
+                f"antigravity tool remap {_agy_tool} -> {_claude_tool}",
+                _n.get("tool_name"),
+                _claude_tool,
+            )
+        # transcriptPath -> transcript_path (Stop holistic review).
+        _agy_stop = _normalize_antigravity_input(
+            {
+                "hook_event_name": "Stop",
+                "conversationId": "agy-conv-1",
+                "transcriptPath": "/tmp/agy-transcript.jsonl",
+            }
+        )
+        check(
+            "antigravity transcriptPath -> transcript_path",
+            _agy_stop.get("transcript_path"),
+            "/tmp/agy-transcript.jsonl",
+        )
+        # B4: an `error` on a PostToolUse payload re-emits PostToolUseFailure so a
+        # failed run_command routes to bash_failure (not a success review).
+        _agy_err = _normalize_antigravity_input(
+            {
+                "hook_event_name": "PostToolUse",
+                "conversationId": "agy-conv-1",
+                "tool_name": "run_command",
+                "tool_input": {"command": "false"},
+                "error": "exit code 1",
+            }
+        )
+        check(
+            "antigravity error -> re-emit PostToolUseFailure (B4)",
+            _agy_err.get("hook_event_name"),
+            "PostToolUseFailure",
+        )
+        check(
+            "antigravity failed run_command classifies to bash_failure",
+            (
+                classify(
+                    _agy_err.get("tool_name", ""),
+                    _agy_err.get("hook_event_name", ""),
+                    _agy_err.get("tool_input", {}),
+                )
+                or (None,)
+            )[0],
+            "bash_failure",
+        )
+        # resolve_host routes the antigravity signature to _normalize_input.
+        _agy_raw = {
+            "hook_event_name": "PostToolUse",
+            "conversationId": "c",
+            "workspacePaths": ["/w"],
+            "tool_name": "write_to_file",
+        }
+        check(
+            "antigravity payload resolves to antigravity host",
+            resolve_host(_agy_raw),
+            "antigravity",
+        )
+        check(
+            "antigravity _normalize_input dispatches to the normalizer",
+            _normalize_input("antigravity", dict(_agy_raw)).get("tool_name"),
+            "Write",
+        )
+
+        # --- Antigravity host: session-id / state-path parity (B5) ---
+        print("\n=== Antigravity Host: State-Path Parity ===")
+        # PostToolUse and Stop for the SAME conversationId must yield the SAME
+        # normalized session_id (so the existing /tmp fail-state flow needs no
+        # change — m4). With REFLECTOR_HOST=antigravity pinned (installer +
+        # hooks.json), the Stop payload need not carry workspacePaths to resolve
+        # the right host — env wins — so write (Post) and read (Stop) hit the
+        # SAME namespaced file.
+        _post_sid = _normalize_antigravity_input(
+            {"hook_event_name": "PostToolUse", "conversationId": "parity-1"}
+        ).get("session_id")
+        _stop_sid = _normalize_antigravity_input(
+            {"hook_event_name": "Stop", "conversationId": "parity-1"}
+        ).get("session_id")
+        check("antigravity session-id parity Post==Stop", _post_sid, _stop_sid)
+        os.environ["REFLECTOR_HOST"] = "antigravity"
+        # Stop payload WITHOUT workspacePaths still resolves to antigravity (env
+        # wins) -> same state path as the PostToolUse write.
+        _stop_no_ws = {"hook_event_name": "Stop", "conversationId": "parity-1"}
+        check(
+            "antigravity Stop (no workspacePaths) resolves to antigravity via env",
+            resolve_host(_stop_no_ws),
+            "antigravity",
+        )
+        check(
+            "antigravity state path: Post host == Stop host",
+            _state_path(_post_sid, "antigravity"),
+            _state_path(_stop_sid, "antigravity"),
+        )
+        os.environ.pop("REFLECTOR_HOST", None)
+
+        # --- B5: host-discriminated state path (default unchanged, agy namespaced) ---
+        print("\n=== Host-Discriminated State Path (B5) ===")
+        # INV-CODEX-PATH-STABLE: the default/identity hosts keep the BYTE-IDENTICAL
+        # bare filename; a no-host call must equal the explicit claude/codex/cursor
+        # call AND the literal legacy filename.
+        _bare = STATE_DIR / "codex-reflector-fails-sess-1.json"
+        check("state path default (no host) unchanged", _state_path("sess-1"), _bare)
+        check("state path claude unchanged", _state_path("sess-1", "claude"), _bare)
+        check("state path codex unchanged", _state_path("sess-1", "codex"), _bare)
+        check(
+            "state path cursor unchanged (already-shipped bare filename)",
+            _state_path("sess-1", "cursor"),
+            _bare,
+        )
+        check(
+            "state path antigravity namespaced",
+            _state_path("sess-1", "antigravity"),
+            STATE_DIR / "codex-reflector-fails-antigravity-sess-1.json",
+        )
+        check(
+            "state path antigravity != default (no collision)",
+            _state_path("sess-1", "antigravity") != _state_path("sess-1"),
+            True,
+        )
+
+        # --- Antigravity host: output renderer (U11) ---
+        print("\n=== Antigravity Host: Output Renderer ===")
+        # PostToolUse FAIL -> {} returned (cannot inject); the FAIL was already
+        # recorded to fail-state by the responder. The renderer NEVER writes
+        # state, so we assert BOTH: (1) renderer returns {} and (2) a real
+        # respond_code_review FAIL under host="antigravity" wrote the namespaced
+        # file. invoke_backend is NOT called here (respond_code_review passed a
+        # verdict / raw directly), so no reviewer spawns.
+        _agy_fail_result = respond_code_review(
+            "agy-render-1",
+            "Write",
+            {"file_path": "x.py"},
+            "FAIL\nSecurity issue.",
+            host="antigravity",
+        )
+        _agy_post_render = _render_host_output(
+            "antigravity", _agy_fail_result, "PostToolUse"
+        )
+        check(
+            "antigravity PostToolUse FAIL renders to ({}, 0) (cannot inject)",
+            _agy_post_render,
+            ({}, 0),
+        )
+        check(
+            "antigravity PostToolUse FAIL recorded to NAMESPACED fail-state",
+            any(
+                e.get("file_path") == "x.py"
+                for e in _read_state("agy-render-1", "antigravity")
+            ),
+            True,
+        )
+        check(
+            "antigravity FAIL did NOT leak into default state file",
+            _read_state("agy-render-1"),
+            [],
+        )
+        clear_fail_state("agy-render-1", "x.py", "antigravity")
+        # Stop with pending FAILs -> decision:"continue" + reason at exit 0 (the
+        # responder's _exit:2 is dropped so main() prints JSON, not stderr/exit-2).
+        _agy_stop_block = {"decision": "block", "reason": "Unresolved FAILs", "_exit": 2}
+        _agy_stop_render = _render_host_output("antigravity", _agy_stop_block, "Stop")
+        check(
+            "antigravity Stop block -> decision:continue at exit 0",
+            _agy_stop_render,
+            ({"decision": "continue", "reason": "Unresolved FAILs"}, 0),
+        )
+        # Stop PASS -> systemMessage only (no steering), exit 0.
+        _agy_stop_pass = _render_host_output(
+            "antigravity", {"systemMessage": "Stop Review PASS:\nok"}, "Stop"
+        )
+        check(
+            "antigravity Stop PASS -> systemMessage exit 0",
+            _agy_stop_pass,
+            ({"systemMessage": "Stop Review PASS:\nok"}, 0),
+        )
+        # PreCompact (cannot inject) -> {} exit 0.
+        check(
+            "antigravity PreCompact -> ({}, 0)",
+            _render_host_output(
+                "antigravity", {"systemMessage": "meta"}, "PreCompact"
+            ),
+            ({}, 0),
+        )
+        # PreToolUse deny cannot be enforced (gate (c)) -> advisory systemMessage,
+        # never silently dropped (allow-by-omission), never a hard block.
+        _agy_deny = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "rce risk",
+            }
+        }
+        _agy_deny_render = _render_host_output("antigravity", _agy_deny, "PreToolUse")
+        check(
+            "antigravity PreToolUse deny -> advisory systemMessage exit 0 (no block)",
+            (
+                _agy_deny_render[1] == 0
+                and "rce risk" in _agy_deny_render[0].get("systemMessage", "")
+                and "decision" not in _agy_deny_render[0]
+                and "hookSpecificOutput" not in _agy_deny_render[0]
+            ),
+            True,
+        )
     finally:
         # Restore env exactly as it was.
         for k, v in _saved_env.items():
@@ -4217,6 +4679,7 @@ def main() -> None:
             _ME_STOP_REVIEW.effort,
             _ME_STOP_REVIEW.model,
             backends=backends,
+            host=host,
         )
 
     # elif event == "SubagentStop":
@@ -4270,6 +4733,7 @@ def main() -> None:
                 event_name=event,
                 label=label,
                 verdict=merged_verdict(results),
+                host=host,
             )
         elif category == "plan_review":
             plan = _find_plan_for_session(hook_data)
@@ -4286,6 +4750,7 @@ def main() -> None:
                 event_name=event,
                 label=label,
                 verdict=merged_verdict(results),
+                host=host,
             )
         elif category == "thinking":
             # Text-only category: concatenate labeled blocks, no merge/state.

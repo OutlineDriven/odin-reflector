@@ -1,0 +1,49 @@
+{
+  "description": "Codex reflector — Antigravity (agy) native JSON hooks. GATED by the user setting `enable_json_hooks` (Antigravity does not fire JSON hooks unless it is enabled). REFLECTOR_HOST=antigravity is pinned on EVERY event so the host-discriminated /tmp fail-state file (codex-reflector-fails-antigravity-{session_id}.json) is written at PostToolUse and READ at Stop under the SAME namespace even when the Stop payload carries no workspacePaths to infer the host. PostToolUse output cannot inject on agy (returns {}); the surfacing point is Stop via decision:\"continue\"+reason. FIRING GATES (KTD-10): (a) hooks fire under `agy -p` with enable_json_hooks; (b) Stop decision:\"continue\"+reason re-injects reason as actionable feedback (UNCONFIRMED — if it fails, agy is advisory-only); (c) PreToolUse deny is UNVERIFIED, so no pre-edit block entry is shipped here.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REFLECTOR_HOST=antigravity python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "timeout": 240
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REFLECTOR_HOST=antigravity python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REFLECTOR_HOST=antigravity python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "timeout": 240
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "REFLECTOR_HOST=antigravity python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
+            "timeout": 240
+          }
+        ]
+      }
+    ]
+  }
+}
