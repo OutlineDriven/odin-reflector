@@ -886,7 +886,7 @@ def invoke_backend(
     """
     out_fd = out_path = None
     prompt_path = None
-    if spec_needs_outfile(backend):
+    if backend.output_capture == "file":
         out_fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex-ref-")
         os.close(out_fd)
     try:
@@ -964,10 +964,6 @@ def invoke_backend(
                 except OSError:
                     pass
 
-
-def spec_needs_outfile(spec: Backend) -> bool:
-    """True when the backend captures output via a `-o` temp file (codex)."""
-    return spec.output_capture == "file"
 
 
 # ---------------------------------------------------------------------------
