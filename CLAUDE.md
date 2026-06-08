@@ -9,7 +9,7 @@ Past solutions & learnings live in `docs/solutions/` — documented bugs, securi
 ```bash
 # Self-test (parser/plan/synthetic guards + Cursor/Grok/Antigravity normalization,
 # fan-out/merge lattice, codex argv byte-identity, read-only levers, pre-edit gate,
-# host renderers) — 270 cases
+# host renderers) — 281 cases
 python3 scripts/codex-reflector.py --test-parse
 
 # Lint
@@ -18,8 +18,11 @@ ruff check scripts/codex-reflector.py
 # Behavioral read-only proof per reviewer (skips absent/unauthed/sandbox-unenforceable CLIs)
 sh scripts/test-readonly.sh
 
-# Shellcheck installers + hook wrappers + harness
-uvx --from shellcheck-py shellcheck scripts/install-*.sh hooks/*-hook.sh scripts/test-readonly.sh
+# Installer idempotency proof (reinstall must not duplicate hooks; skips jq-less installers)
+sh scripts/test-install-idempotent.sh
+
+# Shellcheck installers + hook wrappers + harnesses
+uvx --from shellcheck-py shellcheck scripts/install-*.sh hooks/*-hook.sh scripts/test-readonly.sh scripts/test-install-idempotent.sh
 
 # Debug mode (stderr diagnostics)
 CODEX_REFLECTOR_DEBUG=1

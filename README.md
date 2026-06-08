@@ -163,9 +163,10 @@ Reviewer CLI flags are **version-sensitive**; re-confirm against `--help` if a C
 ## Commands
 
 ```bash
-python3 scripts/codex-reflector.py --test-parse   # self-test (270 cases)
+python3 scripts/codex-reflector.py --test-parse   # self-test (281 cases)
 ruff check scripts/codex-reflector.py             # lint
 sh scripts/test-readonly.sh                       # behavioral read-only proof
+sh scripts/test-install-idempotent.sh             # installer reinstall-idempotency proof
 CODEX_REFLECTOR_DEBUG=1                            # stderr diagnostics
 ```
 
