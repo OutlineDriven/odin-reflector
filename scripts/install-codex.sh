@@ -158,7 +158,12 @@ import sys
 ) = sys.argv[1:7]
 preedit = preedit_s == "1"
 force = force_s == "1"
-ours = {hook_command, preedit_command}
+# Only claim ownership of (and therefore strip) the pre-edit command when
+# pre-edit is enabled this run; otherwise a plain reinstall would silently
+# remove a previously opted-in PreToolUse hard-block hook.
+ours = {hook_command}
+if preedit:
+    ours.add(preedit_command)
 
 # --- Build the desired hook groups (default events + optional PreToolUse) ---
 desired = {
