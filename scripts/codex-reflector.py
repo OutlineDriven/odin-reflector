@@ -2805,10 +2805,11 @@ def _render_host_output(
     """Route a responder result through the per-host output renderer (U7/KTD-7).
 
     claude/codex/cursor share the identity renderer (byte-identical default
-    path). antigravity (U11) gets a dedicated Stop-centric renderer. grok (U10)
-    falls back to identity until its renderer lands so the host axis degrades to
-    Claude-shaped output rather than dropping a review. The canonical lift
-    happens here so every host sees the same schema.
+    path). antigravity (U11) gets a dedicated Stop-centric renderer; grok (U10)
+    gets a dedicated asymmetric renderer (_render_grok_output): a real PreToolUse
+    permissionDecision=deny on stdout, advisory-only (side-channel log + best-
+    effort systemMessage, never additionalContext/exit 2) on post/Stop/PreCompact.
+    The canonical lift happens here so every host sees the same schema.
     """
     canonical = _to_canonical(result, event)
     if host == "grok":
