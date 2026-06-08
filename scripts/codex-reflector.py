@@ -1667,6 +1667,19 @@ def _state_path(session_id: str, host: str = DEFAULT_STATE_HOST) -> Path:
     return STATE_DIR / f"codex-reflector-fails-{safe_host}-{safe}.json"
 
 
+def _resolve_session_id(hook_data: dict, cwd: str) -> str:
+    """Fail-state key. Falls back to a stable per-cwd 'nosession-<hash>' when the
+    host omits session_id, so a PostToolUse FAIL is recorded AND read by Stop
+    under the SAME key (mirrors respond_pretooluse). Without it the empty-id
+    guards in _atomic_update_state/_read_state drop the FAIL silently and Stop
+    never blocks on it. An id the host DID send is returned unchanged
+    (INV-CODEX-PATH-STABLE)."""
+    return hook_data.get("session_id") or (
+        "nosession-"
+        + hashlib.sha256(cwd.encode("utf-8", errors="replace")).hexdigest()[:16]
+    )
+
+
 def _atomic_update_state(
     session_id: str,
     updater: Callable[[list[dict]], list[dict] | None],
@@ -2028,7 +2041,7 @@ def respond_stop(
         debug("stop_hook_active=true, approving stop")
         return None
 
-    session_id = hook_data.get("session_id", "")
+    session_id = _resolve_session_id(hook_data, cwd)
 
     # 2. Fast path: pending FAIL states (no reviewer needed). `host` MUST match
     # the host the FAILs were written under at PostToolUse, else they read from
@@ -5018,6 +5031,44 @@ def run_self_test() -> None:
             True,
         )
 
+        # --- Missing session_id fail-state fallback (#7) ---
+        # _atomic_update_state/_read_state bail on an empty id, so without a
+        # fallback a PostToolUse FAIL is silently lost and Stop never blocks.
+        # main() (write) and respond_stop (read) both route through
+        # _resolve_session_id, so a host that omits session_id still agrees.
+        print("\n=== Missing session_id fail-state fallback (#7) ===")
+        # Helper contract.
+        check(
+            "_resolve_session_id present id unchanged (INV-CODEX-PATH-STABLE)",
+            _resolve_session_id({"session_id": "abc"}, "/c"),
+            "abc",
+        )
+        check("_resolve_session_id missing -> nosession- prefix",
+              _resolve_session_id({}, "/proj/a").startswith("nosession-"), True)
+        check("_resolve_session_id distinct per cwd",
+              _resolve_session_id({}, "/proj/a") != _resolve_session_id({}, "/proj/b"),
+              True)
+        write_fail_state("", "Write", "lost.py", "FAIL")
+        check("empty session_id FAIL is dropped (the latent bug)", _read_state(""), [])
+        # End-to-end READ-side wiring: respond_stop must resolve the SAME id so a
+        # FAIL written for a session-less payload's cwd is found and blocks. A
+        # revert to hook_data.get("session_id","") reads "" -> [] -> no block.
+        # Uses the pending-FAIL fast path (line ~2052) so NO reviewer is spawned.
+        _ns_cwd = "/tmp/ns-stop-cwd"
+        _ns_sid = _resolve_session_id({}, _ns_cwd)
+        write_fail_state(_ns_sid, "Write", "ns.py", "FAIL\nbad")
+        _ns_block = respond_stop(
+            {"hook_event_name": "Stop"}, _ns_cwd, "medium", "", backends=["codex"]
+        )
+        check(
+            "respond_stop blocks on a missing-session FAIL via _resolve_session_id",
+            isinstance(_ns_block, dict)
+            and _ns_block.get("_exit") == 2
+            and "ns.py" in _ns_block.get("reason", ""),
+            True,
+        )
+        clear_fail_state(_ns_sid, "ns.py")
+
         # --- Antigravity host: output renderer (U11) ---
         print("\n=== Antigravity Host: Output Renderer ===")
         # PostToolUse FAIL -> {} returned (cannot inject); the FAIL was already
@@ -5142,7 +5193,7 @@ def main() -> None:
 
     event = hook_data.get("hook_event_name", "")
     cwd = hook_data.get("cwd", os.getcwd())
-    session_id = hook_data.get("session_id", "")
+    session_id = _resolve_session_id(hook_data, cwd)
 
     # Resolve the reviewer set ONCE (KTD-2). Default ["codex"] -> N=1 short-circuit
     # (INV-CODEX-PATH-STABLE). All-unknown -> [] -> fail-open no-op (exit 0).
