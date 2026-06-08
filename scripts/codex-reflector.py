@@ -1668,11 +1668,12 @@ def _state_path(session_id: str, host: str = DEFAULT_STATE_HOST) -> Path:
 
 
 def _resolve_session_id(hook_data: dict, cwd: str) -> str:
-    """Fail-state key. Falls back to a stable per-cwd 'nosession-<hash>' when the
-    host omits session_id, so a PostToolUse FAIL is recorded AND read by Stop
-    under the SAME key (mirrors respond_pretooluse). Without it the empty-id
-    guards in _atomic_update_state/_read_state drop the FAIL silently and Stop
-    never blocks on it. An id the host DID send is returned unchanged
+    """Canonical session key for the PostToolUse-write / Stop-read fail-state
+    paths and the pre-edit deny-loop breaker. Falls back to a stable per-cwd
+    'nosession-<hash>' when the host omits session_id, so a PostToolUse FAIL is
+    recorded AND read by Stop under the SAME key. Without it the empty-id guards
+    in _atomic_update_state/_read_state drop the FAIL silently and Stop never
+    blocks on it. An id the host DID send is returned unchanged
     (INV-CODEX-PATH-STABLE)."""
     return hook_data.get("session_id") or (
         "nosession-"
@@ -2216,12 +2217,11 @@ def respond_pretooluse(hook_data: dict, cwd: str) -> dict | None:
 
     # f. FAIL -> deny, unless the deny-loop breaker has tripped for THIS edit.
     # Deny-loop breaker needs a stable key even when the host omits session_id
-    # (e.g. Grok, whose installer enables the gate unconditionally) — fall back to
-    # a cwd-derived id so the breaker still trips instead of silently disabling.
-    session_id = hook_data.get("session_id") or (
-        "nosession-"
-        + hashlib.sha256(cwd.encode("utf-8", errors="replace")).hexdigest()[:16]
-    )
+    # (e.g. Grok, whose installer enables the gate unconditionally) — the
+    # cwd-derived fallback keeps the breaker tripping instead of silently
+    # disabling. Same scheme as the fail-state paths (INV-PREBLOCK-NOSTATE keeps
+    # this on its OWN deny file, never fail-state).
+    session_id = _resolve_session_id(hook_data, cwd)
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
     key = _deny_key(file_path, _preedit_proposed_text(tool_name, tool_input))
     # Single-reviewer path: attribute to the ONE backend that actually ran
