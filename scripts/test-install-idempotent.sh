@@ -12,7 +12,12 @@
 #
 # POSIX sh. Skips an installer whose merge dependency (jq) is unavailable, the
 # same way scripts/test-readonly.sh skips absent backends — a skip is not a pass.
-set -eu
+#
+# NOTE: `set -e` is deliberately OFF (only `set -u`). A broken installer must be
+# recorded as that installer's FAIL (report() sees a missing/unparseable file ->
+# -1 -> FAIL) and the harness must continue to the remaining installers, not
+# abort on the first non-zero exit and skip the rest of the matrix.
+set -u
 
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 repo=$(CDPATH='' cd -- "$here/.." && pwd -P)
