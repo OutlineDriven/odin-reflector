@@ -1612,16 +1612,19 @@ Focus on what the agent should correct or reinforce going forward."""
 # ---------------------------------------------------------------------------
 
 
-# Hosts whose fail-state file keeps the BARE, un-namespaced filename
-# `codex-reflector-fails-{session_id}.json` (INV-CODEX-PATH-STABLE / B5).
-# claude+codex are the protected default; cursor is already shipped against the
-# bare filename, so namespacing it now would silently orphan in-flight Cursor
-# state. Reuse _IDENTITY_HOSTS as the single source of truth so the bare set and
-# the identity-renderer set can never drift. Every OTHER host (antigravity U11,
-# grok U10) is namespaced as `codex-reflector-fails-{host}-{session_id}.json` so
-# concurrent sessions on different hosts can never collide on one /tmp file.
-# NOTE: _IDENTITY_HOSTS is defined later (host seam section); referenced lazily
-# inside _state_path at call time, never at import, so order is irrelevant.
+# Hosts whose wire shape + exit-code contract is byte-identical to Claude Code,
+# AND whose fail-state file keeps the BARE, un-namespaced filename
+# `codex-reflector-fails-{session_id}.json` (INV-CODEX-PATH-STABLE / B5). codex is
+# a near-clone of Claude Code's hook protocol; cursor accepts Claude's nested
+# hookSpecificOutput response format (see CLAUDE.md) and already shipped against
+# the bare filename, so namespacing it now would silently orphan in-flight Cursor
+# state. All three therefore share the single identity renderer (host seam) AND
+# the bare state path. Every OTHER host (antigravity U11, grok U10) is namespaced
+# as `codex-reflector-fails-{host}-{session_id}.json` so concurrent sessions on
+# different hosts can never collide on one /tmp file. Single source of truth so
+# the bare set and the identity-renderer set can never drift.
+_IDENTITY_HOSTS: frozenset[str] = frozenset({"claude", "codex", "cursor"})
+
 DEFAULT_STATE_HOST = "claude"
 
 
@@ -2645,11 +2648,10 @@ def _render_grok_output(
 
 KNOWN_HOSTS: tuple[str, ...] = ("claude", "codex", "cursor", "grok", "antigravity")
 
-# Hosts whose wire shape + exit-code contract is byte-identical to Claude Code.
-# codex is a near-clone of Claude Code's hook protocol; cursor accepts Claude's
-# nested hookSpecificOutput response format (see CLAUDE.md). All three therefore
-# share the single identity renderer below.
-_IDENTITY_HOSTS: frozenset[str] = frozenset({"claude", "codex", "cursor"})
+# The hosts whose wire shape + exit-code contract is byte-identical to Claude
+# Code share the single identity renderer below: see `_IDENTITY_HOSTS` (defined
+# with the fail-state path helpers, its only consumer) for the membership +
+# rationale.
 
 # Canonical response representation, decoupled from any host wire shape (U7/m1).
 # The structured fields are what a NON-identity renderer (grok/antigravity) maps
