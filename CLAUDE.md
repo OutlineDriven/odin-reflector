@@ -99,7 +99,7 @@ Committed `hooks/hooks.json` (Claude Code) routes 4 events (`PostToolUse`, `Post
 
 ### Data flow
 
-```
+```text
 stdin JSON → resolve_host() → _normalize_input(host) → classify() → _gate_model_effort(codex-only)
   → build_*_prompt() → fan_out(backends) [N=1 inline; N>1 ThreadPoolExecutor]
   → merge_verdicts() → respond_*() → _render_host_output(host) → exit 0/2
