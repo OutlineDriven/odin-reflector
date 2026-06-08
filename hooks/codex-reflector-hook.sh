@@ -13,5 +13,5 @@
 # fallback. install-codex.sh generates its OWN absolute-path wrapper for the
 # ~/.codex/hooks.json merge path and does not use this file.
 export REFLECTOR_HOST=codex
-plugin_root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
+plugin_root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}}"
 exec python3 "${plugin_root}/scripts/codex-reflector.py" "$@"

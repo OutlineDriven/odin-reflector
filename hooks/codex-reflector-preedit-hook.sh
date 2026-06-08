@@ -6,5 +6,5 @@
 # hooks/codex-hooks-preedit.json fragment, never the default wiring.
 export REFLECTOR_HOST=codex
 export REFLECTOR_PREEDIT_BLOCK=1
-plugin_root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
+plugin_root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}}"
 exec python3 "${plugin_root}/scripts/codex-reflector.py" "$@"

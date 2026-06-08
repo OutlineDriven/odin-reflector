@@ -13,5 +13,5 @@
 # carries no workspacePaths, so without the pin resolve_host() would infer
 # "claude" at Stop and read the wrong (bare) file, silently losing the FAIL.
 export REFLECTOR_HOST=antigravity
-plugin_root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}"
+plugin_root="${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}}"
 exec python3 "${plugin_root}/scripts/codex-reflector.py" "$@"
