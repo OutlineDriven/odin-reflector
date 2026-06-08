@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2212,6 +2213,220 @@ def _normalize_cursor_input(hook_data: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Host seam (Axis B / U7 / KTD-7) — two symmetric seams + a canonical schema
+# ---------------------------------------------------------------------------
+#
+# Host coupling lives ONLY here (KTD-7): the router (classify, prompt builders,
+# fan-out, merge, responders) stays host-agnostic. Two symmetric seams bracket
+# it — an INPUT normalizer (host payload -> canonical Claude-shaped hook_data)
+# and an OUTPUT renderer (responder result -> host wire dict + exit code).
+#
+# DESIGN CHOICE (proves INV-CODEX-PATH-STABLE most easily):
+# Responders are LEFT UNCHANGED — they keep returning today's exact wire-shaped
+# dicts. `_to_canonical()` reads the structured fields out of that dict for the
+# FUTURE grok/antigravity renderers (U10/U11) to build from, but ALSO stashes the
+# untouched original dict in `Canonical.raw`. The claude/codex/cursor renderer is
+# a single shared IDENTITY function that ignores the structured fields and emits
+# straight from `raw` using the SAME two lines the legacy output boundary used:
+#   exit_code = result.get("_exit", 2 if result.get("decision")=="block" else 0)
+#   payload   = {k: v for k, v in result.items() if k != "_exit"}
+# So byte-identity on the default host is a tautology (same dict, same lines) —
+# the canonical refactor cannot drift the Claude/Codex wire shape.
+
+KNOWN_HOSTS: tuple[str, ...] = ("claude", "codex", "cursor", "grok", "antigravity")
+
+# Hosts whose wire shape + exit-code contract is byte-identical to Claude Code.
+# codex is a near-clone of Claude Code's hook protocol; cursor accepts Claude's
+# nested hookSpecificOutput response format (see CLAUDE.md). All three therefore
+# share the single identity renderer below.
+_IDENTITY_HOSTS: frozenset[str] = frozenset({"claude", "codex", "cursor"})
+
+# Canonical response representation, decoupled from any host wire shape (U7/m1).
+# The structured fields are what a NON-identity renderer (grok/antigravity) maps
+# to its own wire shape; `raw` is the untouched responder dict the identity
+# renderer re-emits verbatim. `raw` may be None (allow / no-op) or {} (silent).
+#
+# The field set is COMPLETE for the two real consumers (grok U10 / antigravity
+# U11): every piece of user-facing text those renderers must surface has a home
+# here so they never have to reach back into `raw`. In particular both `reason`
+# (Stop block / UNCERTAIN / pre-edit deny detail) and `permission_decision_reason`
+# (the "why this edit was blocked" string a PreToolUse deny carries) are lifted
+# explicitly — dropping either would silently lose the message the user needs.
+# The wire `event` is threaded as a parameter to every renderer (and to
+# `_to_canonical`), so it is NOT duplicated as a canonical field (no drift).
+Canonical = namedtuple(
+    "Canonical",
+    [
+        "systemMessage",
+        "additionalContext",
+        "reason",
+        "blocking",
+        "permission_decision",
+        "permission_decision_reason",
+        "raw",
+    ],
+)
+
+
+def _to_canonical(result: dict | None, event: str) -> Canonical:
+    """Lift a responder's wire dict into the canonical schema (host-agnostic).
+
+    Pulls the structured fields out — `additionalContext`/`permissionDecision`/
+    `permissionDecisionReason` live nested under `hookSpecificOutput`, while
+    `reason` (Stop block / UNCERTAIN text) is top-level; `blocking` is True when
+    the dict carries `decision=="block"` or `_exit==2` — and stashes the
+    UNTOUCHED dict in `raw` so the identity renderer can re-emit it
+    byte-for-byte. A falsy result ({}/None) yields an all-None canonical with
+    `raw` preserved as-is. `event` is accepted for signature symmetry with the
+    render boundary (`_render_host_output`, which threads `event` to the per-host
+    renderers); it is NOT stored on the tuple (the wire event is read from the
+    `event` param at render time, never duplicated here — avoids drift).
+    """
+    result = result or {}
+    hso = result.get("hookSpecificOutput") or {}
+    blocking = result.get("decision") == "block" or result.get("_exit") == 2
+    return Canonical(
+        systemMessage=result.get("systemMessage"),
+        additionalContext=hso.get("additionalContext"),
+        reason=result.get("reason"),
+        blocking=blocking,
+        permission_decision=hso.get("permissionDecision"),
+        permission_decision_reason=hso.get("permissionDecisionReason"),
+        raw=result if result else None,
+    )
+
+
+def _render_identity_output(
+    canonical: Canonical, event: str
+) -> tuple[dict | None, int]:
+    """Claude / Codex / Cursor renderer — byte-identical to the legacy boundary.
+
+    Re-emits the responder dict verbatim from `canonical.raw` and computes the
+    exit code with the EXACT expression the pre-refactor `main()` used, so the
+    Claude/Codex/Cursor wire shape and exit codes cannot drift (INV-CODEX-PATH-
+    STABLE). A None/empty `raw` renders as (None, 0): nothing printed, exit 0 —
+    matching today's `if result:` guard for allow / no-op responses.
+    """
+    result = canonical.raw
+    if not result:
+        return None, 0
+    exit_code = result.get("_exit", 2 if result.get("decision") == "block" else 0)
+    payload = {k: v for k, v in result.items() if k != "_exit"}
+    return payload, exit_code
+
+
+def _render_host_output(
+    host: str, result: dict | None, event: str
+) -> tuple[dict | None, int]:
+    """Route a responder result through the per-host output renderer (U7/KTD-7).
+
+    claude/codex/cursor share the identity renderer (byte-identical default
+    path). grok (U10) and antigravity (U11) get dedicated renderers that build
+    from the canonical structured fields; until then they fall back to identity
+    so the host axis degrades to Claude-shaped output rather than dropping a
+    review. The canonical lift happens here so every host sees the same schema.
+    """
+    canonical = _to_canonical(result, event)
+    # grok / antigravity renderers land in U10 / U11. Clean extension point:
+    #   if host == "grok":        return _render_grok_output(canonical, event)
+    #   if host == "antigravity": return _render_antigravity_output(canonical, event)
+    return _render_identity_output(canonical, event)
+
+
+def resolve_host(payload: dict) -> str:
+    """Resolve the active host name (m2). Returns a KNOWN_HOSTS string always.
+
+    Precedence: REFLECTOR_HOST env wins (validated against KNOWN_HOSTS; an
+    unknown value falls through to inference, never escapes). Else infer from
+    distinguishing payload keys:
+      cursor      = conversation_id + workspace_roots
+      antigravity = conversationId  + workspacePaths
+      grok        = hookEventName   + workspaceRoot
+    Ambiguous (more than one signature matches) or no signature -> "claude", the
+    safe identity default. MUST run on the RAW payload BEFORE normalization (the
+    normalizers rewrite/consume the very keys inference reads).
+    """
+    env_host = (os.environ.get("REFLECTOR_HOST") or "").strip().lower()
+    if env_host in KNOWN_HOSTS:
+        return env_host
+
+    matches = []
+    # Cursor's PRIMARY discriminator is the camelCase event name (postToolUse /
+    # stop / postToolUseFailure / ...), present on EVERY Cursor event and never a
+    # key of Claude's PascalCase scheme — so this cannot false-positive on a
+    # Claude payload (default byte-identity preserved). LOAD-BEARING: before U7,
+    # _normalize_cursor_input ran unconditionally, so Cursor payloads that lack
+    # workspace_roots (e.g. a Shell failure carrying only tool_name) were still
+    # remapped. Keying cursor only on conversation_id+workspace_roots would miss
+    # those and silently drop the review (camelCase event -> unhandled branch).
+    if payload.get("hook_event_name") in _CURSOR_EVENT_MAP:
+        matches.append("cursor")
+    elif "conversation_id" in payload and "workspace_roots" in payload:
+        # Belt-and-suspenders: catch a Cursor payload even if the event name is
+        # already Claude-cased (shouldn't happen, but the key pair is decisive).
+        matches.append("cursor")
+    if "conversationId" in payload and "workspacePaths" in payload:
+        matches.append("antigravity")
+    if "hookEventName" in payload and "workspaceRoot" in payload:
+        matches.append("grok")
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        debug(f"ambiguous host signature {matches}, defaulting to claude")
+    return "claude"
+
+
+def _normalize_input(host: str, hook_data: dict) -> dict:
+    """Dispatch host payload -> canonical Claude-shaped hook_data (U7).
+
+    codex/claude are identity (already Claude-shaped). cursor uses the existing
+    `_normalize_cursor_input`. grok (U10) / antigravity (U11) normalizers are
+    deliberately NOT implemented here — they fall through to identity with a
+    debug note, a clean extension point that keeps U7 minimal.
+    """
+    if host == "cursor":
+        return _normalize_cursor_input(hook_data)
+    if host in ("grok", "antigravity"):
+        debug(f"no {host} input normalizer yet (U10/U11); identity passthrough")
+    return hook_data
+
+
+def _backend_available(name: str, spec: Backend) -> bool:
+    """Conservative presence probe for a reviewer backend binary (m3).
+
+    Uses `shutil.which` — a NAME-based presence check, never output string
+    matching (avoids false-positives on normal output, per fix m-e). A missing
+    binary is already handled fail-open inside `invoke_backend` (FileNotFoundError
+    -> "" -> excluded by merge_verdicts as infra-empty, NOT UNCERTAIN), so absence
+    can never wedge Stop. This probe only adds a VISIBLE notice so a silently
+    excluded backend (e.g. a logged-out / uninstalled CLI) is diagnosable.
+    """
+    return shutil.which(spec.bin) is not None
+
+
+def probe_backends(backends: list[str]) -> str | None:
+    """Return a user-visible notice if any SELECTED backend binary is absent (m3).
+
+    Strict no-op when every selected backend is present (the byte-identical
+    default path with codex installed): returns None, emits nothing, changes no
+    exit code. Only when a selected binary is MISSING does it log a debug line
+    and return a short systemMessage-ready notice; the missing backend is still
+    treated as infra-empty downstream (excluded from merge, not UNCERTAIN), so
+    the notice is purely diagnostic and never blocks.
+    """
+    missing = [n for n in backends if n in BACKENDS and not _backend_available(n, BACKENDS[n])]
+    if not missing:
+        return None
+    for n in missing:
+        debug(f"selected reviewer backend not on PATH: {n} ({BACKENDS[n].bin})")
+    labels = ", ".join(_BACKEND_LABELS.get(n, n) for n in missing)
+    return (
+        f"Reflector: reviewer backend(s) not found on PATH: {labels}. "
+        f"Skipped (treated as no-output, not a FAIL)."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Self-test mode
 # ---------------------------------------------------------------------------
 
@@ -2467,6 +2682,7 @@ def run_self_test() -> None:
         "REFLECTOR_BACKEND",
         "CODEX_REFLECTOR_BACKEND",
         "REFLECTOR_PREEDIT_BLOCK",
+        "REFLECTOR_HOST",
     )
     _saved_env = {k: os.environ.get(k) for k in _override_vars}
 
@@ -3292,6 +3508,314 @@ def run_self_test() -> None:
             _pre_denies = _deny_state_path(_pre_sid)
             if _pre_denies.exists():
                 _pre_denies.unlink()
+
+        # --- Host seam: identity renderer byte-identity (U7 / INV-CODEX-PATH-STABLE) ---
+        # The claude & codex renderers MUST reproduce the EXACT pre-refactor wire
+        # dict + exit code the legacy main() boundary emitted, for every divergent
+        # response shape. Each oracle below is the literal dict today's code would
+        # have printed (after stripping _exit) paired with the exit code the legacy
+        # expression `result.get("_exit", 2 if decision=="block" else 0)` yields.
+        # A drift in the canonical lift / identity renderer fails the suite.
+        print("\n=== Host Seam: Identity Renderer Byte-Identity ===")
+        _identity_oracles = [
+            (
+                "PostToolUse code_change FAIL (systemMessage + additionalContext, exit 0)",
+                {
+                    "systemMessage": "Codex Reflector FAIL [x.py]:\nbad",
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": "Codex Review FAIL [x.py]:\nbad",
+                    },
+                },
+                "PostToolUse",
+                (
+                    {
+                        "systemMessage": "Codex Reflector FAIL [x.py]:\nbad",
+                        "hookSpecificOutput": {
+                            "hookEventName": "PostToolUse",
+                            "additionalContext": "Codex Review FAIL [x.py]:\nbad",
+                        },
+                    },
+                    0,
+                ),
+            ),
+            (
+                "Stop block (decision + reason + _exit 2, no hookSpecificOutput)",
+                {
+                    "decision": "block",
+                    "reason": "Codex Stop Review FAIL:\nbad",
+                    "_exit": 2,
+                },
+                "Stop",
+                (
+                    {"decision": "block", "reason": "Codex Stop Review FAIL:\nbad"},
+                    2,
+                ),
+            ),
+            (
+                "PreToolUse deny (permissionDecision, no _exit/decision -> exit 0)",
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "Codex blocked this edit:\nrce",
+                    }
+                },
+                "PreToolUse",
+                (
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": "Codex blocked this edit:\nrce",
+                        }
+                    },
+                    0,
+                ),
+            ),
+            (
+                "PreCompact (systemMessage only, exit 0)",
+                {"systemMessage": "Session metacognition (by Codex):\ninsight"},
+                "PreCompact",
+                (
+                    {"systemMessage": "Session metacognition (by Codex):\ninsight"},
+                    0,
+                ),
+            ),
+        ]
+        for _desc, _result, _ev, _expected in _identity_oracles:
+            for _h in ("claude", "codex"):
+                check(
+                    f"{_h} identity renderer: {_desc}",
+                    _render_host_output(_h, _result, _ev),
+                    _expected,
+                )
+        # PreToolUse allow == None responder result -> (None, 0): nothing printed.
+        check(
+            "identity renderer: pre-edit allow (None) -> (None, 0)",
+            _render_host_output("claude", None, "PreToolUse"),
+            (None, 0),
+        )
+        # Falsy {} (respond_thinking with no output) -> (None, 0): nothing printed.
+        check(
+            "identity renderer: empty {} -> (None, 0)",
+            _render_host_output("codex", {}, "PostToolUse"),
+            (None, 0),
+        )
+        # cursor shares the identity renderer (accepts Claude nested response).
+        check(
+            "cursor identity renderer reproduces Stop block exit 2",
+            _render_host_output(
+                "cursor",
+                {"decision": "block", "reason": "r", "_exit": 2},
+                "Stop",
+            ),
+            ({"decision": "block", "reason": "r"}, 2),
+        )
+
+        # --- Host seam: canonical lift fidelity (U7) ---
+        print("\n=== Host Seam: Canonical Lift ===")
+        _canon_fail = _to_canonical(
+            {
+                "systemMessage": "sm",
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": "ac",
+                },
+            },
+            "PostToolUse",
+        )
+        check("canonical pulls systemMessage", _canon_fail.systemMessage, "sm")
+        check("canonical pulls nested additionalContext", _canon_fail.additionalContext, "ac")
+        check("canonical block=False for non-block", _canon_fail.blocking, False)
+        _canon_block = _to_canonical(
+            {"decision": "block", "reason": "r", "_exit": 2}, "Stop"
+        )
+        check("canonical blocking=True on decision=block", _canon_block.blocking, True)
+        # Stop block / UNCERTAIN text must reach a renderer via canonical.reason
+        # (grok/antigravity U10/U11 surface it without reaching into raw).
+        check("canonical pulls top-level reason", _canon_block.reason, "r")
+        _canon_deny = _to_canonical(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "blocked: rce",
+                }
+            },
+            "PreToolUse",
+        )
+        check("canonical pulls permission_decision", _canon_deny.permission_decision, "deny")
+        # The "why this edit was blocked" string must survive the lift so a grok
+        # PreToolUse renderer (U10) can surface it (closes the silent-drop trap).
+        check(
+            "canonical pulls permission_decision_reason",
+            _canon_deny.permission_decision_reason,
+            "blocked: rce",
+        )
+        # Absent optional fields lift to None (not KeyError / not the wire event).
+        check("canonical reason None when absent", _canon_deny.reason, None)
+        check(
+            "canonical permission_decision_reason None when absent",
+            _canon_fail.permission_decision_reason,
+            None,
+        )
+        check("canonical None result -> raw None", _to_canonical(None, "Stop").raw, None)
+
+        # --- Host seam: resolve_host precedence + inference (U7 / m2) ---
+        # REFLECTOR_HOST is in the saved/cleared override set so these mutations
+        # are restored by the outer finally.
+        print("\n=== Host Seam: resolve_host ===")
+        os.environ.pop("REFLECTOR_HOST", None)
+        host_cases = [
+            ({}, "claude", "no signature -> claude"),
+            (
+                {"conversation_id": "c", "workspace_roots": ["/w"]},
+                "cursor",
+                "cursor key signature",
+            ),
+            (
+                {"conversationId": "c", "workspacePaths": ["/w"]},
+                "antigravity",
+                "antigravity key signature",
+            ),
+            (
+                {"hookEventName": "PostToolUse", "workspaceRoot": "/w"},
+                "grok",
+                "grok key signature",
+            ),
+            # Bare Cursor payloads — the regression class U7 must NOT reintroduce.
+            # Before U7 _normalize_cursor_input ran on EVERY payload; these lack
+            # workspace_roots, so keying cursor on the workspace-key pair alone
+            # would misroute them to claude and silently drop the review (camelCase
+            # event -> unhandled branch). The camelCase event discriminator catches
+            # them.
+            (
+                {"hook_event_name": "stop", "conversation_id": "c", "loop_count": 0},
+                "cursor",
+                "bare cursor stop (no workspace_roots) via event name",
+            ),
+            (
+                {"hook_event_name": "postToolUseFailure", "tool_name": "Shell"},
+                "cursor",
+                "bare cursor Shell failure (no workspace keys) via event name",
+            ),
+            (
+                {
+                    "conversation_id": "c",
+                    "workspace_roots": ["/w"],
+                    "conversationId": "c",
+                    "workspacePaths": ["/w"],
+                },
+                "claude",
+                "ambiguous (two signatures) -> claude",
+            ),
+        ]
+        for _payload, _expected, _desc in host_cases:
+            check(f"resolve_host {_desc}", resolve_host(_payload), _expected)
+        # REFLECTOR_HOST env wins over inference; unknown value falls through.
+        os.environ["REFLECTOR_HOST"] = "grok"
+        check(
+            "resolve_host: REFLECTOR_HOST env wins over cursor signature",
+            resolve_host({"conversation_id": "c", "workspace_roots": ["/w"]}),
+            "grok",
+        )
+        os.environ["REFLECTOR_HOST"] = "bogus-host"
+        check(
+            "resolve_host: unknown REFLECTOR_HOST falls through to inference",
+            resolve_host({"conversation_id": "c", "workspace_roots": ["/w"]}),
+            "cursor",
+        )
+        os.environ.pop("REFLECTOR_HOST", None)
+
+        # --- Host seam: input dispatch (_normalize_input) ---
+        print("\n=== Host Seam: Input Dispatch ===")
+        _claude_in = {"hook_event_name": "Stop", "session_id": "s"}
+        check(
+            "claude input dispatch is identity",
+            _normalize_input("claude", dict(_claude_in)),
+            _claude_in,
+        )
+        check(
+            "codex input dispatch is identity",
+            _normalize_input("codex", dict(_claude_in)),
+            _claude_in,
+        )
+        # cursor dispatch maps the event name (delegates to _normalize_cursor_input).
+        check(
+            "cursor input dispatch maps event name",
+            _normalize_input(
+                "cursor", {"hook_event_name": "postToolUse"}
+            ).get("hook_event_name"),
+            "PostToolUse",
+        )
+        # grok/antigravity have no normalizer yet -> identity passthrough (U10/U11).
+        check(
+            "grok input dispatch is identity passthrough (U10)",
+            _normalize_input("grok", dict(_claude_in)),
+            _claude_in,
+        )
+
+        # End-to-end seam (regression guard): a BARE Cursor postToolUseFailure with
+        # NO workspace_roots must resolve to cursor and normalize so the event lands
+        # in a ROUTABLE Claude branch — not the silent "unhandled event" exit that
+        # U7 would have caused by gating the normalizer on workspace keys alone.
+        _bare_cursor = {
+            "hook_event_name": "postToolUseFailure",
+            "tool_name": "Shell",
+            "tool_input": {"command": "false"},
+            "error": "boom",
+        }
+        _bare_host = resolve_host(_bare_cursor)
+        check("bare cursor failure resolves to cursor host", _bare_host, "cursor")
+        _bare_norm = _normalize_input(_bare_host, dict(_bare_cursor))
+        check(
+            "bare cursor failure normalizes event to routable PostToolUseFailure",
+            _bare_norm.get("hook_event_name"),
+            "PostToolUseFailure",
+        )
+        check(
+            "bare cursor Shell failure normalizes tool_name to Bash",
+            _bare_norm.get("tool_name"),
+            "Bash",
+        )
+        # The normalized pair must actually classify (not fall to the skip/None
+        # path) — proving the review runs end-to-end, not silently dropped.
+        check(
+            "bare cursor failure classifies to bash_failure",
+            (
+                classify(
+                    _bare_norm.get("tool_name", ""),
+                    _bare_norm.get("hook_event_name", ""),
+                    _bare_norm.get("tool_input", {}),
+                )
+                or (None,)
+            )[0],
+            "bash_failure",
+        )
+
+        # --- Host seam: backend presence probe (m3) ---
+        # Strict no-op when all present; notice when a selected binary is absent.
+        # shutil.which is monkeypatched so the test never depends on what is on PATH.
+        print("\n=== Host Seam: Backend Presence Probe ===")
+        _real_which = shutil.which
+        try:
+            shutil.which = lambda _b: "/usr/bin/" + _b  # type: ignore[assignment]
+            check(
+                "probe_backends all-present -> None (no notice)",
+                probe_backends(["codex"]),
+                None,
+            )
+            shutil.which = lambda _b: None  # type: ignore[assignment]
+            _notice = probe_backends(["grok"])
+            check("probe_backends absent -> notice string", isinstance(_notice, str), True)
+            check(
+                "probe_backends notice names the missing backend label",
+                "Grok" in (_notice or ""),
+                True,
+            )
+        finally:
+            shutil.which = _real_which  # type: ignore[assignment]
     finally:
         # Restore env exactly as it was.
         for k, v in _saved_env.items():
@@ -3324,7 +3848,12 @@ def main() -> None:
     except (json.JSONDecodeError, OSError):
         sys.exit(0)  # fail-open
 
-    hook_data = _normalize_cursor_input(hook_data)
+    # Resolve the host ONCE on the RAW payload BEFORE normalization (U7/m2): the
+    # normalizers rewrite/consume the very keys host inference reads. The same
+    # host string is reused at the output boundary so input/output seams agree.
+    host = resolve_host(hook_data)
+    debug(f"host={host}")
+    hook_data = _normalize_input(host, hook_data)
 
     event = hook_data.get("hook_event_name", "")
     cwd = hook_data.get("cwd", os.getcwd())
@@ -3337,6 +3866,14 @@ def main() -> None:
         debug("no recognized reviewer backends, fail-open exit 0")
         sys.exit(0)
     label = REVIEWER_LABEL(backends)
+
+    # Visible notice (m3) if a selected backend binary is absent. Strict no-op
+    # (None, nothing printed) when all selected backends are present — the
+    # byte-identical default path with codex installed is untouched.
+    backend_notice = probe_backends(backends)
+    if backend_notice:
+        debug(backend_notice)
+        print(backend_notice, file=sys.stderr)
 
     debug(f"event={event} tool={hook_data.get('tool_name', 'N/A')} backends={backends}")
 
@@ -3459,18 +3996,23 @@ def main() -> None:
         debug(f"unhandled event: {event}")
         sys.exit(0)
 
-    # Output: exit 0 = JSON to stdout, exit 2 = blocking (stderr fed to Claude)
+    # Output boundary: route the responder result through the per-host renderer
+    # (U7/KTD-7). For claude/codex/cursor this is the identity renderer, so the
+    # (payload, exit_code) pair is byte-identical to the legacy boundary below.
+    # The `if result:` guard stays so a falsy {} (e.g. respond_thinking with no
+    # output) or None (pre-edit allow) prints nothing — never an empty `{}` dict.
     if result:
-        exit_code = result.get("_exit", 2 if result.get("decision") == "block" else 0)
-        payload = {k: v for k, v in result.items() if k != "_exit"}
-        if exit_code >= 2:
-            # Exit 2: stderr text fed to Claude as context
-            print(
-                payload.get("reason", payload.get("systemMessage", "")), file=sys.stderr
-            )
-            sys.exit(exit_code)
-        # Exit 0: JSON to stdout — systemMessage + hookSpecificOutput processed
-        print(json.dumps(payload))
+        payload, exit_code = _render_host_output(host, result, event)
+        if payload is not None:
+            if exit_code >= 2:
+                # Exit 2: stderr text fed to Claude as context
+                print(
+                    payload.get("reason", payload.get("systemMessage", "")),
+                    file=sys.stderr,
+                )
+                sys.exit(exit_code)
+            # Exit 0: JSON to stdout — systemMessage + hookSpecificOutput processed
+            print(json.dumps(payload))
     sys.exit(0)
 
 
