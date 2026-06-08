@@ -939,6 +939,15 @@ def invoke_backend(
         if backend.output_capture == "file":
             result = Path(out_path).read_text(errors="replace").strip()
         else:
+            # stdout-capture backends: a nonzero exit (e.g. a present-but-
+            # logged-out grok/claude/cursor-agent/agy) may print auth-error text
+            # to stdout. Treat that as infra-empty (KTD-11) so merge_verdicts
+            # EXCLUDES it rather than parsing it to UNCERTAIN — which on Stop
+            # (fail-closed) would wedge the agent. codex is file-capture and keeps
+            # its read-regardless-of-exit behavior (INV-CODEX-PATH-STABLE).
+            if proc.returncode != 0:
+                debug(f"{backend.bin} exited {proc.returncode}; infra-empty")
+                return ""
             result = (proc.stdout or "").strip()
         debug(f"{backend.bin} returned {len(result)} chars")
         return result
