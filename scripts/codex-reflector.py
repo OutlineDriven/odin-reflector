@@ -4255,7 +4255,9 @@ def run_self_test() -> None:
             ).get("hook_event_name"),
             "PreToolUse",
         )
-        # antigravity has no normalizer yet -> identity passthrough (U11).
+        # antigravity normalizer is a no-op on already-Claude-shaped input, so
+        # dispatch returns it unchanged (the camelCase-envelope mapping in
+        # _normalize_antigravity_input only fires on a raw agy payload — U11).
         check(
             "antigravity input dispatch is identity passthrough (U11)",
             _normalize_input("antigravity", dict(_claude_in)),
