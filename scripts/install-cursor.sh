@@ -133,11 +133,15 @@ mkdir -p "$settings_dir"
 
 if [ -f "$settings_path" ] && [ "$force" -ne 1 ]; then
   if command -v jq >/dev/null 2>&1; then
-    jq --arg codex_command "$codex_command" -s '
-      def without_codex($command):
+    jq --arg script "$reflector_script" -s '
+      # Strip ANY prior reflector hook by matching the unique script path as a
+      # substring — covers both the bare command and the
+      # "REFLECTOR_PREEDIT_BLOCK=1 ..." pre-edit variant, so repeated installs
+      # (incl. --pre-edit) stay idempotent instead of accumulating duplicates.
+      def without_reflector($script):
         map(
           if has("hooks") then
-            . + {hooks: (.hooks | map(select((.command // "") != $command)))}
+            . + {hooks: (.hooks | map(select(((.command // "") | contains($script)) | not)))}
           else
             .
           end
@@ -150,7 +154,7 @@ if [ -f "$settings_path" ] && [ "$force" -ne 1 ]; then
       | $existing + {
           hooks: reduce $keys[] as $key ({};
             .[$key] = (
-              (($existing.hooks[$key] // []) | without_codex($codex_command))
+              (($existing.hooks[$key] // []) | without_reflector($script))
               + ($codex.hooks[$key] // [])
             )
           )
