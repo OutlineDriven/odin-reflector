@@ -104,11 +104,11 @@ sh scripts/test-readonly.sh            # all reviewers; absent/unauthed/sandbox-
 sh scripts/test-readonly.sh codex grok # a subset
 ```
 
-Behavioral status (snapshot test env): **claude** and **grok** verified (write-attempt blocked); **codex** FAILs (see gap below); **cursor-agent** and **agy** were skipped (not authenticated there) — rerun where they are logged in.
+Behavioral status (snapshot test env): **claude** and **grok** verified (write-attempt blocked); **codex** SKIPs here (its `--sandbox read-only` cannot be set up on this Landlock-restricted kernel, so codex refuses to run — safe: no writes, the review fails open); **cursor-agent** and **agy** were skipped (not authenticated there) — rerun where they are logged in / on a sandbox-capable host.
 
 ## Per-host gaps & known limitations (honest)
 
-- **codex read-only is currently DEFEATED by `--full-auto`.** On codex 0.137.0 the deprecated `--full-auto` flag (passed alongside `--sandbox read-only`) resolves the effective sandbox to `workspace-write`, so the codex reviewer can write to the workspace. `scripts/test-readonly.sh` FAILs codex for this reason — INV-READONLY is **not** behaviorally verified for codex pending a flag fix. If running codex read-only matters to you, treat this as open.
+- **codex read-only.** `_codex_argv` passes `--sandbox read-only`. The deprecated `--full-auto` flag — which on codex 0.137.0 resolved the effective sandbox to `workspace-write` and overrode read-only — has been **REMOVED**. Consequence: codex runs read-only on a sandbox-capable host, or REFUSES to run where the kernel cannot set up its sandbox (e.g. Landlock restricted: `Failed to create stream fd`), in which case the review fails open (no review, no writes) — it never runs unsandboxed. `scripts/test-readonly.sh` PASSes codex on a capable host and SKIPs it where the sandbox can't be enforced.
 - **Antigravity is advisory-only** until its firing gates are confirmed live: Stop re-injection and PreToolUse deny are unconfirmed. A FAIL is recorded and shown at Stop but does not steer the agent.
 - **Cursor cloud agents do not fire `Stop`** — the Stop checkpoint degrades to per-event review there.
 - **Grok honors hook output only on `PreToolUse`** — after-edit/Stop reviews are advisory (logged to `/tmp/codex-reflector-grok-advisory-{session}.log` + a best-effort notification).

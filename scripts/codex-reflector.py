@@ -99,7 +99,7 @@ _PRE_EDIT_MAX_DENIES = 2
 #                    When present (codex), it REPLACES bin/subcmd/read_only/
 #                    model/effort assembly so the legacy argv is reproduced
 #                    exactly (the fixed codex flags --skip-git-repo-check /
-#                    --full-auto / --ephemeral live only in the builder).
+#                    --ephemeral live only in the builder).
 #   prompt_file_threshold - byte threshold above which a flag_value backend
 #                    spills the prompt to a temp file (grok --prompt-file).
 #   extra_argv     - fixed trailing flags appended after model_argv, before the
@@ -155,7 +155,9 @@ def _codex_argv(model: str, effort: str, apply_override: bool = True) -> list[st
         "--sandbox",
         "read-only",
         "--skip-git-repo-check",
-        "--full-auto",
+        # --full-auto REMOVED (INV-READONLY): on codex >=0.137.0 it resolves the
+        # sandbox to workspace-write, overriding --sandbox read-only. See README/
+        # CLAUDE.md. Deliberate break of the old byte-identical codex argv.
         "--ephemeral",
         "-c",
         f"model_reasoning_effort={effort}",
@@ -3190,7 +3192,6 @@ def run_self_test() -> None:
             "--sandbox",
             "read-only",
             "--skip-git-repo-check",
-            "--full-auto",
             "--ephemeral",
             "-c",
             "model_reasoning_effort=medium",
@@ -3219,7 +3220,6 @@ def run_self_test() -> None:
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
-                "--full-auto",
                 "--ephemeral",
                 "-c",
                 "model_reasoning_effort=high",

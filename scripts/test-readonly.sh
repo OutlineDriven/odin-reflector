@@ -135,10 +135,10 @@ run_backend() {
   _prompt=$2
   case "$_b" in
     codex)
-      # NOTE: --full-auto MIRRORS the reflector's _codex_argv exactly (the codex
-      # reviewer row). Do NOT drop it to make the test pass — that would prove a
-      # sandbox the reflector never runs. read-only is the lever under test.
-      with_timeout codex exec --sandbox read-only --skip-git-repo-check --full-auto --ephemeral - <<EOF
+      # MIRRORS the reflector's _codex_argv exactly (codex reviewer row). NOTE:
+      # --full-auto was REMOVED from _codex_argv (it resolved the sandbox to
+      # workspace-write, overriding read-only — INV-READONLY); keep this in sync.
+      with_timeout codex exec --sandbox read-only --skip-git-repo-check --ephemeral - <<EOF
 ${_prompt}
 EOF
       ;;
