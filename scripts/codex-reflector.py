@@ -332,7 +332,6 @@ def _read_tail(path: str, max_bytes: int = 20_000) -> str:
         with open(path, "r", errors="replace") as f:
             if size > max_bytes:
                 f.seek(size - max_bytes)
-                # Skip partial first line to avoid splitting a line in the middle
                 f.readline()  # skip partial first line (standard tail — incomplete line at seek boundary)
             return f.read()
     except OSError:
@@ -392,10 +391,11 @@ _FAIL_WORDS = {"FAIL", "FAILED", "REJECTED", "REJECT", "BLOCKED", "BLOCK"}
 
 def parse_verdict(raw: str) -> str:
     """Parse PASS / FAIL / UNCERTAIN from codex output. Fail-open."""
-    if not raw.strip():
+    stripped = raw.strip()
+    if not stripped:
         return "UNCERTAIN"
     found_pass = found_fail = False
-    for line in raw.strip().splitlines()[:5]:
+    for line in stripped.splitlines()[:5]:
         clean = _NOISE.sub("", line).strip()
         if not clean:
             continue
