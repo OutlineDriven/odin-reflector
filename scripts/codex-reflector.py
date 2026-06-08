@@ -1128,7 +1128,13 @@ def fan_out(
                     spec,
                 )
             )
-        return [(name, _future_raw(f)) for name, f in zip(backends, futures)]
+        # strict=True: backends and futures are built in lockstep, so a length
+        # mismatch is a bug — fail loud rather than silently truncate (a dropped
+        # backend on a fail-closed Stop would invert it). Also satisfies B905.
+        return [
+            (name, _future_raw(f))
+            for name, f in zip(backends, futures, strict=True)
+        ]
 
 
 def format_reviewer_blocks(results: list[tuple[str, str]]) -> str:
