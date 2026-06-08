@@ -3302,6 +3302,15 @@ def run_self_test() -> None:
                 any(f in argv_str for f in forbidden),
                 False,
             )
+        # INV-VERDICT-TEXT: claude must request plain text (verdict on line 1) —
+        # a JSON output mode would wrap the verdict and defeat parse_verdict.
+        _claude_argv = _build_backend_argv(BACKENDS["claude"], "", "medium", "")
+        check(
+            "claude argv carries --output-format text (INV-VERDICT-TEXT)",
+            "--output-format" in _claude_argv
+            and _claude_argv[_claude_argv.index("--output-format") + 1] == "text",
+            True,
+        )
         check("grok sandbox is read-only (never strict)", "strict" in " ".join(
             _build_backend_argv(BACKENDS["grok"], "", "medium", "")
         ), False)
