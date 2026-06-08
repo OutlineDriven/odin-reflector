@@ -1,0 +1,42 @@
+{
+  "description": "Codex native hooks wiring for codex-reflector. Mirrors hooks/hooks.json (Codex's hook schema is a near-clone of Claude Code's). Routes PostToolUse, Stop, PreCompact through hooks/codex-reflector-hook.sh, a committed wrapper that exports REFLECTOR_HOST=codex (so the host normalizer re-emits PostToolUseFailure on error payloads -- B4) and execs the reflector. The wrapper relies only on single-variable ${CLAUDE_PLUGIN_ROOT} expansion (Codex sets it for plugin-hook compatibility), avoiding any dependency on Codex shell-interpreting an inline env-prefix. The pre-edit PreToolUse hard-block is OPT-IN and lives in the separate hooks/codex-hooks-preedit.json fragment (install-codex.sh wires it only with --preedit). install-codex.sh's ~/.codex/hooks.json merge path generates its own absolute-path wrapper instead of using ${CLAUDE_PLUGIN_ROOT}.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/codex-reflector-hook.sh\"",
+            "timeout": 360,
+            "statusMessage": "Codex reflector: reviewing tool output"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/codex-reflector-hook.sh\"",
+            "timeout": 240,
+            "statusMessage": "Codex reflector: stop-time review"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/codex-reflector-hook.sh\"",
+            "timeout": 240,
+            "statusMessage": "Codex reflector: pre-compaction summary"
+          }
+        ]
+      }
+    ]
+  }
+}

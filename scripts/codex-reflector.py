@@ -2208,6 +2208,126 @@ def respond_pretooluse(hook_data: dict, cwd: str) -> dict | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# Codex host normalizer (Axis B / U8 / B4) — PostToolUseFailure re-emit
+# ---------------------------------------------------------------------------
+#
+# Codex's stdin payload is ~1:1 with Claude's (same fields, same PascalCase
+# events), so the normalizer is IDENTITY for the common case. The one live
+# divergence is the failure-diagnostic flow: Codex fires a single `PostToolUse`
+# for every tool call, carrying the result (incl. errors) in `tool_response` —
+# it does NOT emit a separate `PostToolUseFailure` event the way Claude Code
+# does. Without a re-emit, `classify()` would route a FAILED Bash call to the
+# success-path `code_change` review (or skip it), and the dedicated
+# `bash_failure` / `code_change_failure` diagnostic prompts would be DEAD code
+# on Codex. B4: detect an error in a Codex PostToolUse payload and rewrite the
+# event to `PostToolUseFailure` so the router reaches the failure diagnostic.
+#
+# INV-CODEX-PATH-STABLE: a NON-error Codex PostToolUse payload is returned
+# byte-for-byte unchanged (full identity). The re-emit trips ONLY on a truthy
+# error signal — never on the mere PRESENCE of `tool_response` (a successful
+# Bash call also carries one). Detection is inclusive on field NAMES, strict on
+# SEMANTICS: a top-level/nested `error`, or a non-zero exit code under any of the
+# common key spellings.
+
+# Exit-code fields a Codex/Claude tool_response may use; non-zero => failure.
+# ONLY UNAMBIGUOUS spellings: `code`/`status` are deliberately EXCLUDED because
+# they routinely hold NON-exit numerics (e.g. an HTTP-ish MCP result's
+# {"status": 200} / {"code": 1}) — treating those as a failure would flip a
+# SUCCESS payload to PostToolUseFailure and violate INV-CODEX-PATH-STABLE. The
+# asymmetry favors precision: a missed failure under an exotic spelling is a soft
+# fail-open miss; a false re-emit on success is a hard invariant break.
+_CODEX_EXIT_KEYS = ("exitCode", "exit_code", "returncode", "returnCode")
+
+
+def _codex_exit_is_nonzero(value: object) -> bool:
+    """True iff an exit-code-like value denotes a non-zero (failed) exit.
+
+    Accepts int or numeric-string spellings; anything non-numeric (e.g. a
+    free-form status string like "ok") is treated as NOT a failure so an
+    ambiguous field can never spuriously flip a success payload to a failure
+    (INV-CODEX-PATH-STABLE). A literal 0 / "0" is success.
+    """
+    if isinstance(value, bool):  # bool is an int subclass; never an exit code
+        return False
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip()
+        if s.lstrip("-").isdigit():
+            return int(s) != 0
+    return False
+
+
+def _codex_error_text(hook_data: dict) -> str | None:
+    """Return failure-evidence text for a Codex PostToolUse payload, else None.
+
+    Returns None when the payload shows NO error signal (the byte-identical
+    success path). Otherwise returns a non-empty diagnostic string lifted from
+    the strongest available signal, so the re-emitted PostToolUseFailure carries
+    `error` for `build_bash_failure_prompt` to surface. Signals (any one trips):
+      - a truthy top-level `error`
+      - a truthy `tool_response.error`
+      - `tool_response.success is False` (explicit failure flag)
+      - a non-zero exit code under any `_CODEX_EXIT_KEYS` spelling
+        (top-level or nested in `tool_response`)
+    """
+    top_error = hook_data.get("error")
+    if top_error:
+        return str(top_error)
+
+    tr = hook_data.get("tool_response")
+    tr_dict = tr if isinstance(tr, dict) else {}
+
+    tr_error = tr_dict.get("error")
+    if tr_error:
+        return str(tr_error)
+
+    if tr_dict.get("success") is False:
+        stderr = tr_dict.get("stderr") or tr_dict.get("stdout") or ""
+        return str(stderr) or "tool reported success=false"
+
+    for key in _CODEX_EXIT_KEYS:
+        if key in hook_data and _codex_exit_is_nonzero(hook_data.get(key)):
+            stderr = tr_dict.get("stderr") or ""
+            return str(stderr) or f"tool exited with non-zero {key}={hook_data.get(key)!r}"
+        if key in tr_dict and _codex_exit_is_nonzero(tr_dict.get(key)):
+            stderr = tr_dict.get("stderr") or ""
+            return str(stderr) or f"tool exited with non-zero {key}={tr_dict.get(key)!r}"
+
+    return None
+
+
+def _normalize_codex_input(hook_data: dict) -> dict:
+    """Map a Codex-shaped hook payload into the Claude-shaped fields we route on.
+
+    Codex stdin is ~1:1 with Claude, so this is IDENTITY for everything except
+    the B4 failure re-emit: a `PostToolUse` payload that carries an error / a
+    non-zero tool result is rewritten to `PostToolUseFailure` (and its error text
+    lifted to top-level `error`) so `classify()` routes it to the
+    `bash_failure` / `code_change_failure` diagnostic flow instead of the
+    success-path review — keeping that flow LIVE on Codex.
+
+    INV-CODEX-PATH-STABLE: a non-error PostToolUse (or any non-PostToolUse event)
+    is returned UNCHANGED — no key is added, removed, or rewritten.
+    """
+    if hook_data.get("hook_event_name") != "PostToolUse":
+        return hook_data
+
+    error_text = _codex_error_text(hook_data)
+    if not error_text:
+        return hook_data  # success path: full identity (INV-CODEX-PATH-STABLE)
+
+    debug(f"codex PostToolUse carries error -> re-emit PostToolUseFailure: {error_text[:120]!r}")
+    hook_data["hook_event_name"] = "PostToolUseFailure"
+    # Lift the diagnostic into top-level `error` so build_bash_failure_prompt /
+    # build_code_change_failure_prompt have it (mirrors _normalize_cursor_input's
+    # field-lifting). Never clobber an already-present top-level error.
+    if not hook_data.get("error"):
+        hook_data["error"] = error_text
+    return hook_data
+
+
 _CURSOR_EVENT_MAP = {
     "preToolUse": "PreToolUse",
     "postToolUse": "PostToolUse",
@@ -2738,13 +2858,18 @@ def resolve_host(payload: dict) -> str:
 
 
 def _normalize_input(host: str, hook_data: dict) -> dict:
-    """Dispatch host payload -> canonical Claude-shaped hook_data (U7).
+    """Dispatch host payload -> canonical Claude-shaped hook_data (U7/U8).
 
-    codex/claude are identity (already Claude-shaped). cursor uses the existing
+    claude is identity (already Claude-shaped). codex uses
+    `_normalize_codex_input` — identity for the common case, but re-emits
+    `PostToolUseFailure` from an error-carrying PostToolUse payload (B4) so the
+    failure-diagnostic flow is live on Codex. cursor uses the existing
     `_normalize_cursor_input`. grok (U10) / antigravity (U11) normalizers are
     deliberately NOT implemented here — they fall through to identity with a
-    debug note, a clean extension point that keeps U7 minimal.
+    debug note, a clean extension point.
     """
+    if host == "codex":
+        return _normalize_codex_input(hook_data)
     if host == "cursor":
         return _normalize_cursor_input(hook_data)
     if host == "grok":
@@ -4126,6 +4251,280 @@ def run_self_test() -> None:
             "antigravity input dispatch is identity passthrough (U11)",
             _normalize_input("antigravity", dict(_claude_in)),
             _claude_in,
+        )
+
+        # --- Codex host: B4 PostToolUseFailure re-emit + INV-CODEX-PATH-STABLE ---
+        # (B4) A Codex PostToolUse Bash payload carrying an error must re-emit as
+        # PostToolUseFailure and then classify to bash_failure — proving the
+        # failure-diagnostic flow is LIVE on Codex, not dead.
+        print("\n=== Codex Host: B4 Failure Re-emit ===")
+        _codex_bash_err = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"stdout": "", "stderr": "boom", "exitCode": 1},
+        }
+        _codex_bash_err_norm = _normalize_codex_input(dict(_codex_bash_err))
+        check(
+            "codex Bash error PostToolUse re-emits PostToolUseFailure (B4)",
+            _codex_bash_err_norm.get("hook_event_name"),
+            "PostToolUseFailure",
+        )
+        check(
+            "codex re-emit lifts error text to top-level error (B4)",
+            _codex_bash_err_norm.get("error"),
+            "boom",
+        )
+        check(
+            "codex Bash error routes to bash_failure after re-emit (B4)",
+            (
+                classify(
+                    _codex_bash_err_norm.get("tool_name", ""),
+                    _codex_bash_err_norm.get("hook_event_name", ""),
+                    _codex_bash_err_norm.get("tool_input", {}),
+                )
+                or (None,)
+            )[0],
+            "bash_failure",
+        )
+        # Top-level `error` field signal (no exit code) trips the re-emit too.
+        check(
+            "codex top-level error field re-emits PostToolUseFailure (B4)",
+            _normalize_codex_input(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "x"},
+                    "error": "exploded",
+                }
+            ).get("hook_event_name"),
+            "PostToolUseFailure",
+        )
+        # Nested tool_response.error with no exit code trips it.
+        check(
+            "codex nested tool_response.error re-emits (B4)",
+            _normalize_codex_input(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "a.py"},
+                    "tool_response": {"error": "patch did not apply"},
+                }
+            ).get("hook_event_name"),
+            "PostToolUseFailure",
+        )
+        # (INV-CODEX-PATH-STABLE) A NON-error Codex PostToolUse (which still carries
+        # a tool_response with exitCode 0) must pass through byte-for-byte unchanged
+        # — full-dict equality, the strongest invariant check. The `_expected`
+        # literals are constructed INDEPENDENTLY (no shared nested references) so a
+        # future regression that mutated a nested object can never compare equal to
+        # an aliased expected dict (a false green).
+        check(
+            "codex non-error PostToolUse is byte-identical (INV-CODEX-PATH-STABLE)",
+            _normalize_codex_input(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "echo hi"},
+                    "tool_response": {"stdout": "hi", "stderr": "", "exitCode": 0},
+                    "session_id": "s",
+                }
+            ),
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+                "tool_response": {"stdout": "hi", "stderr": "", "exitCode": 0},
+                "session_id": "s",
+            },
+        )
+        # A success payload with no exit/error fields at all is also unchanged.
+        check(
+            "codex no-error-signal PostToolUse is unchanged (INV-CODEX-PATH-STABLE)",
+            _normalize_codex_input(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": "a.py", "content": "x = 1"},
+                    "tool_response": {"filePath": "a.py"},
+                }
+            ),
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "a.py", "content": "x = 1"},
+                "tool_response": {"filePath": "a.py"},
+            },
+        )
+        # A non-PostToolUse Codex event (e.g. Stop) is identity — never touched.
+        check(
+            "codex non-PostToolUse event is identity",
+            _normalize_codex_input(dict(_claude_in)),
+            _claude_in,
+        )
+        # An ambiguous non-numeric status string must NOT flip to failure.
+        check(
+            "codex ambiguous status string does not trip re-emit",
+            _normalize_codex_input(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "x"},
+                    "tool_response": {"status": "ok"},
+                }
+            ).get("hook_event_name"),
+            "PostToolUse",
+        )
+        # (INV-CODEX-PATH-STABLE) A SUCCESS payload whose tool_response carries a
+        # non-exit numeric under the ambiguous `status`/`code` spelling (e.g. an
+        # HTTP-ish MCP result {"status": 200}) must NOT re-emit — those spellings
+        # are excluded from _CODEX_EXIT_KEYS precisely to protect the success path.
+        check(
+            "codex numeric status (HTTP-ish) does NOT re-emit (INV-CODEX-PATH-STABLE)",
+            _normalize_codex_input(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "x"},
+                    "tool_response": {"status": 200},
+                }
+            ).get("hook_event_name"),
+            "PostToolUse",
+        )
+        check(
+            "codex numeric code does NOT re-emit (INV-CODEX-PATH-STABLE)",
+            _normalize_codex_input(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "x"},
+                    "tool_response": {"code": 7},
+                }
+            ).get("hook_event_name"),
+            "PostToolUse",
+        )
+
+        # _codex_exit_is_nonzero unit cases (numeric semantics, bool guard).
+        for _val, _exp in (
+            (0, False),
+            (1, True),
+            (-1, True),
+            ("0", False),
+            ("2", True),
+            ("ok", False),
+            (True, False),  # bool is an int subclass but is never an exit code
+            (None, False),
+        ):
+            check(f"_codex_exit_is_nonzero({_val!r})", _codex_exit_is_nonzero(_val), _exp)
+
+        # --- Codex host: packaging artifacts parse + match documented schema (U8) ---
+        # Manifest (.codex-plugin/plugin.json) + hooks files (hooks/codex-hooks.json
+        # and the opt-in hooks/codex-hooks-preedit.json) must be valid JSON and match
+        # the Codex hook schema shape (nested {hooks:{Event:[{matcher?,hooks:[{type,
+        # command,...}]}]}}, same near-clone shape as Claude's hooks/hooks.json).
+        print("\n=== Codex Host: Packaging Manifest + Hooks Schema ===")
+        _repo_root = Path(__file__).resolve().parent.parent
+
+        def _load_json(rel: str) -> object:
+            try:
+                return json.loads((_repo_root / rel).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover
+                return f"PARSE-ERROR: {exc}"
+
+        def _is_codex_hook_schema(doc: object, expect_events: set) -> bool:
+            """Validate a Codex hooks doc: nested hooks.<Event>[].hooks[].{type,command}."""
+            if not isinstance(doc, dict) or not isinstance(doc.get("hooks"), dict):
+                return False
+            events = doc["hooks"]
+            if set(events) != expect_events:
+                return False
+            for groups in events.values():
+                if not isinstance(groups, list) or not groups:
+                    return False
+                for group in groups:
+                    if not isinstance(group, dict):
+                        return False
+                    inner = group.get("hooks")
+                    if not isinstance(inner, list) or not inner:
+                        return False
+                    for hook in inner:
+                        if not isinstance(hook, dict):
+                            return False
+                        if hook.get("type") != "command":
+                            return False
+                        if not isinstance(hook.get("command"), str) or not hook["command"]:
+                            return False
+            return True
+
+        _manifest = _load_json(".codex-plugin/plugin.json")
+        check(
+            "codex plugin.json parses as a JSON object",
+            isinstance(_manifest, dict),
+            True,
+        )
+        check(
+            "codex plugin.json mirrors plugin name",
+            _manifest.get("name") if isinstance(_manifest, dict) else None,
+            "codex-reflector",
+        )
+        check(
+            "codex plugin.json declares hooks capability -> ./hooks/codex-hooks.json",
+            _manifest.get("hooks") if isinstance(_manifest, dict) else None,
+            "./hooks/codex-hooks.json",
+        )
+
+        _codex_hooks = _load_json("hooks/codex-hooks.json")
+        check(
+            "codex-hooks.json matches documented schema (PostToolUse/Stop/PreCompact)",
+            _is_codex_hook_schema(
+                _codex_hooks, {"PostToolUse", "Stop", "PreCompact"}
+            ),
+            True,
+        )
+        # Default wiring must NOT contain PreToolUse (opt-in only; fix M-A parity).
+        check(
+            "codex-hooks.json default has NO PreToolUse entry (opt-in only)",
+            "PreToolUse" not in (_codex_hooks.get("hooks", {}) if isinstance(_codex_hooks, dict) else {}),
+            True,
+        )
+        # Every default command routes through the committed wrapper (which sets
+        # REFLECTOR_HOST=codex so B4 re-emit is live). Env-setting lives in the
+        # wrapper file, NOT an inline command env-prefix, so it does not depend on
+        # Codex shell-interpreting the command string.
+        _codex_cmds = [
+            h["command"]
+            for groups in (_codex_hooks.get("hooks", {}) if isinstance(_codex_hooks, dict) else {}).values()
+            for g in groups
+            for h in g["hooks"]
+        ]
+        check(
+            "codex-hooks.json commands all route through codex-reflector-hook.sh",
+            all("codex-reflector-hook.sh" in c for c in _codex_cmds) and bool(_codex_cmds),
+            True,
+        )
+        # The committed wrapper sets REFLECTOR_HOST=codex (B4 live on Codex).
+        _wrapper = (_repo_root / "hooks/codex-reflector-hook.sh").read_text(encoding="utf-8")
+        check(
+            "codex-reflector-hook.sh exports REFLECTOR_HOST=codex (B4 live)",
+            "REFLECTOR_HOST=codex" in _wrapper,
+            True,
+        )
+
+        _preedit = _load_json("hooks/codex-hooks-preedit.json")
+        check(
+            "codex-hooks-preedit.json matches schema (PreToolUse only)",
+            _is_codex_hook_schema(_preedit, {"PreToolUse"}),
+            True,
+        )
+        # The opt-in fragment routes through the pre-edit wrapper, which enables
+        # the pre-edit gate (REFLECTOR_PREEDIT_BLOCK=1) explicitly.
+        _pe_wrapper = (_repo_root / "hooks/codex-reflector-preedit-hook.sh").read_text(
+            encoding="utf-8"
+        )
+        check(
+            "codex-reflector-preedit-hook.sh sets REFLECTOR_PREEDIT_BLOCK=1",
+            "REFLECTOR_PREEDIT_BLOCK=1" in _pe_wrapper,
+            True,
         )
 
         # End-to-end seam (regression guard): a BARE Cursor postToolUseFailure with
