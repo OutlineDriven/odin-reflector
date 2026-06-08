@@ -2,20 +2,29 @@
 set -eu
 
 usage() {
-  printf '%s\n' "Usage: $0 [--force] [target-project-dir]"
+  printf '%s\n' "Usage: $0 [--force] [--pre-edit] [target-project-dir]"
   printf '%s\n' ""
   printf '%s\n' "Installs Cursor third-party Claude hook settings for codex-reflector."
   printf '%s\n' "Without target-project-dir, writes to ~/.claude/settings.json."
   printf '%s\n' "With target-project-dir, writes to target-project-dir/.claude/settings.json."
+  printf '%s\n' ""
+  printf '%s\n' "--pre-edit  Also wire the opt-in PreToolUse pre-edit deny gate (maps via"
+  printf '%s\n' "            Cursor's preToolUse). The hook still self-gates on"
+  printf '%s\n' "            REFLECTOR_PREEDIT_BLOCK at runtime, so it is inert unless enabled."
 }
 
 force=0
+pre_edit=0
 target_root=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --force)
       force=1
+      shift
+      ;;
+    --pre-edit)
+      pre_edit=1
       shift
       ;;
     -h|--help)
@@ -60,48 +69,61 @@ tmp_new=$(mktemp)
 tmp_merged=$(mktemp)
 trap 'rm -f "$tmp_new" "$tmp_merged"' EXIT INT HUP TERM
 
-python3 - "$reflector_script" > "$tmp_new" <<'PY'
+python3 - "$reflector_script" "$pre_edit" > "$tmp_new" <<'PY'
 import json
 import sys
 
 script = sys.argv[1]
+pre_edit = len(sys.argv) > 2 and sys.argv[2] == "1"
 command = f'python3 "{script}"'
 
-settings = {
-    "hooks": {
-        "PostToolUse": [
-            {
-                "matcher": "Write|Edit|MultiEdit|Patch|NotebookEdit|ExitPlanMode|mcp__.*morph.*|mcp__.*edit.*|mcp__.*edit_file.*|mcp__.*sequentialthinking.*|mcp__.*sequential_thinking.*|mcp__.*actor-critic.*|mcp__.*shannon.*",
-                "hooks": [
-                    {"type": "command", "command": command, "timeout": 240},
-                ],
-            }
-        ],
-        "PostToolUseFailure": [
-            {
-                "hooks": [
-                    {"type": "command", "command": command, "timeout": 120},
-                ],
-            }
-        ],
-        "Stop": [
-            {
-                "hooks": [
-                    {"type": "command", "command": command, "timeout": 240},
-                ],
-            }
-        ],
-        "PreCompact": [
-            {
-                "hooks": [
-                    {"type": "command", "command": command, "timeout": 240},
-                ],
-            }
-        ],
-    }
+hooks = {
+    "PostToolUse": [
+        {
+            "matcher": "Write|Edit|MultiEdit|Patch|NotebookEdit|ExitPlanMode|mcp__.*morph.*|mcp__.*edit.*|mcp__.*edit_file.*|mcp__.*sequentialthinking.*|mcp__.*sequential_thinking.*|mcp__.*actor-critic.*|mcp__.*shannon.*",
+            "hooks": [
+                {"type": "command", "command": command, "timeout": 240},
+            ],
+        }
+    ],
+    "PostToolUseFailure": [
+        {
+            "hooks": [
+                {"type": "command", "command": command, "timeout": 120},
+            ],
+        }
+    ],
+    "Stop": [
+        {
+            "hooks": [
+                {"type": "command", "command": command, "timeout": 240},
+            ],
+        }
+    ],
+    "PreCompact": [
+        {
+            "hooks": [
+                {"type": "command", "command": command, "timeout": 240},
+            ],
+        }
+    ],
 }
 
-print(json.dumps(settings, indent=2))
+if pre_edit:
+    # Opt-in pre-edit deny gate (maps via Cursor's preToolUse). Synchronous —
+    # the edit waits on it — so a shorter timeout than the post-event hooks. The
+    # script still self-gates on REFLECTOR_PREEDIT_BLOCK at runtime, so this is
+    # inert unless that env var is set.
+    hooks["PreToolUse"] = [
+        {
+            "matcher": "Write|Edit|MultiEdit|Patch|NotebookEdit|mcp__.*edit.*|mcp__.*morph.*",
+            "hooks": [
+                {"type": "command", "command": command, "timeout": 120},
+            ],
+        }
+    ]
+
+print(json.dumps({"hooks": hooks}, indent=2))
 PY
 
 mkdir -p "$settings_dir"
