@@ -51,6 +51,12 @@ done
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 plugin_root=$(dirname -- "$script_dir")
 reflector_script="${plugin_root}/scripts/codex-reflector.py"
+# The two EXACT hook commands this installer emits (must byte-match what the
+# python heredoc generates): the bare post-event command and the pre-edit
+# variant. The merge strips exactly these so reinstall is idempotent WITHOUT
+# clobbering a user's own hooks that merely mention the reflector path.
+codex_command="python3 \"${reflector_script}\""
+pre_edit_command="REFLECTOR_PREEDIT_BLOCK=1 ${codex_command}"
 
 if [ ! -f "$reflector_script" ]; then
   printf '%s\n' "Cannot find codex-reflector.py at: $reflector_script" >&2
@@ -132,15 +138,14 @@ mkdir -p "$settings_dir"
 
 if [ -f "$settings_path" ] && [ "$force" -ne 1 ]; then
   if command -v jq >/dev/null 2>&1; then
-    jq --arg script "$reflector_script" -s '
-      # Strip ANY prior reflector hook by matching the unique script path as a
-      # substring — covers both the bare command and the
-      # "REFLECTOR_PREEDIT_BLOCK=1 ..." pre-edit variant, so repeated installs
-      # (incl. --pre-edit) stay idempotent instead of accumulating duplicates.
-      def without_reflector($script):
+    jq --arg cmd "$codex_command" --arg precmd "$pre_edit_command" -s '
+      # Strip ONLY our two exact generated commands (bare + pre-edit variant),
+      # so reinstall is idempotent for both --pre-edit and plain runs WITHOUT
+      # clobbering a user-authored hook that merely references the reflector path.
+      def without_reflector($cmd; $precmd):
         map(
           if has("hooks") then
-            . + {hooks: (.hooks | map(select(((.command // "") | contains($script)) | not)))}
+            . + {hooks: (.hooks | map(select((.command // "") as $c | $c != $cmd and $c != $precmd)))}
           else
             .
           end
@@ -153,7 +158,7 @@ if [ -f "$settings_path" ] && [ "$force" -ne 1 ]; then
       | $existing + {
           hooks: reduce $keys[] as $key ({};
             .[$key] = (
-              (($existing.hooks[$key] // []) | without_reflector($script))
+              (($existing.hooks[$key] // []) | without_reflector($cmd; $precmd))
               + ($codex.hooks[$key] // [])
             )
           )

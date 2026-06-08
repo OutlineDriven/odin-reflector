@@ -88,6 +88,27 @@ if [ "$have_jq" -eq 1 ]; then
   r1_total=$(inspect_hooks "$d/.claude/settings.json" | cut -d' ' -f1)
   sh "$repo/scripts/install-cursor.sh" --pre-edit "$d" >/dev/null 2>&1
   report "install-cursor.sh --pre-edit" "$d/.claude/settings.json"
+
+  # Over-strip regression: a USER hook that merely REFERENCES the reflector path
+  # (but is not one of our two exact commands) must survive a reinstall. The
+  # dedup must match our exact commands, never any command containing the path.
+  python3 - "$d/.claude/settings.json" "$repo/scripts/codex-reflector.py" <<'PY'
+import json, sys
+f, ref = sys.argv[1], sys.argv[2]
+data = json.load(open(f))
+data["hooks"].setdefault("PostToolUse", []).append(
+    {"hooks": [{"type": "command", "command": f'mylogger python3 "{ref}" --tail'}]}
+)
+json.dump(data, open(f, "w"))
+PY
+  sh "$repo/scripts/install-cursor.sh" --pre-edit "$d" >/dev/null 2>&1
+  if grep -q 'mylogger' "$d/.claude/settings.json"; then
+    printf 'PASS install-cursor.sh preserves a user hook referencing the reflector path\n'
+    pass=$((pass + 1))
+  else
+    printf 'FAIL install-cursor.sh stripped a user hook (dedup over-matched the path)\n'
+    fail=$((fail + 1))
+  fi
 else
   printf 'SKIP install-cursor.sh (jq unavailable)\n'; skip=$((skip + 1))
 fi
