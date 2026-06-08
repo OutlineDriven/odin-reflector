@@ -2222,6 +2222,149 @@ def _normalize_cursor_input(hook_data: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Grok host adapter (Axis B / U10 / KTD-9) — advisory post/Stop + PreToolUse block
+# ---------------------------------------------------------------------------
+#
+# Grok runs this repo through its Claude-compat hook discovery: it scans
+# ~/.claude/settings.json, sets CLAUDE_PROJECT_DIR, and sends Claude-SHAPED stdin
+# (camelCase envelope keys but otherwise the same fields). So input normalization
+# is MINIMAL — a thin camelCase->snake_case remap plus a cwd fallback.
+#
+# The asymmetry that makes Grok its own host (KTD-9): Grok honors hook STDOUT
+# ONLY on PreToolUse. On passive/post/Stop events it DROPS stdout (and exit-2
+# stderr is advisory-dropped too), so a Stop/PostToolUse FAIL cannot block or
+# inject context there. Therefore:
+#   - PreToolUse  -> render the permissionDecision="deny" shape on stdout (a REAL
+#                    hard-block; this is U6's respond_pretooluse output).
+#   - post/Stop   -> ADVISORY: persist the feedback to a side-channel log file
+#                    (the reliable record) + emit a best-effort systemMessage,
+#                    but NEVER additionalContext (the channel Grok drops) and
+#                    NEVER exit 2 (would masquerade as a block Grok won't honor).
+
+
+def _normalize_grok_input(hook_data: dict) -> dict:
+    """Map Grok's Claude-compat stdin envelope into the Claude-shaped fields (U10).
+
+    Minimal by design (KTD-9): Grok already sends Claude-shaped stdin via its
+    ~/.claude/settings.json discovery, so this only remaps the camelCase envelope
+    keys Grok uses and supplies a cwd fallback:
+      - hookEventName -> hook_event_name (the event the router branches on)
+      - workspaceRoot -> cwd, else $CLAUDE_PROJECT_DIR (Grok sets this) -> cwd
+      - sessionId / conversationId -> session_id (state-file key parity)
+    Existing snake_case fields are left untouched (idempotent), so a payload that
+    is already Claude-shaped passes through unchanged. Mutate-and-return, mirroring
+    `_normalize_cursor_input`.
+    """
+    if "hookEventName" in hook_data and "hook_event_name" not in hook_data:
+        hook_data["hook_event_name"] = hook_data["hookEventName"]
+
+    if not hook_data.get("cwd"):
+        root = hook_data.get("workspaceRoot")
+        if not root:
+            roots = hook_data.get("workspaceRoots") or []
+            root = roots[0] if roots else None
+        if not root:
+            root = os.environ.get("CLAUDE_PROJECT_DIR")
+        if root:
+            hook_data["cwd"] = root
+
+    if "session_id" not in hook_data:
+        sid = hook_data.get("sessionId") or hook_data.get("conversationId")
+        if sid:
+            hook_data["session_id"] = sid
+
+    return hook_data
+
+
+def _grok_advisory_log(session_id: str, event: str, text: str) -> None:
+    """Append a Grok advisory record to the side-channel log (U10, fail-open).
+
+    Grok drops hook stdout on passive/post/Stop events, so the verdict/feedback
+    cannot reach the agent's context there. This log is the RELIABLE delivery
+    channel for those advisory reviews (the deferred follow-up may add an HTTP
+    side-channel; a log file is the documented starting point). Best-effort: any
+    I/O failure is swallowed (debug-only) — a logging failure must never raise
+    into the hook and wedge the host.
+    """
+    if not text:
+        return
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id or "nosession")
+    path = STATE_DIR / f"codex-reflector-grok-advisory-{safe}.log"
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"=== {event} ===\n{text}\n\n")
+    except OSError as exc:  # pragma: no cover - diagnostic only
+        debug(f"grok advisory log write failed: {exc}")
+
+
+def _render_grok_output(
+    canonical: Canonical, event: str
+) -> tuple[dict | None, int]:
+    """Grok renderer (U10/KTD-9): real PreToolUse deny, advisory everywhere else.
+
+    PreToolUse (the ONLY channel Grok honors): emit the
+    `hookSpecificOutput.permissionDecision="deny"` shape on stdout, exit 0 — a
+    real hard-block (INV-DENY-STDOUT). A PreToolUse allow (no permission_decision)
+    renders as (None, 0): nothing printed, the user's normal permission prompt
+    runs. The exact deny wire-shape is U10 smoke-test-gated; if Grok diverges,
+    THIS function is the single mapping point.
+
+    Passive / post / Stop (Grok DROPS stdout there): persist the advisory to the
+    side-channel log (reliable) and emit a best-effort `systemMessage` only —
+    NEVER `additionalContext` (the dropped channel) and NEVER exit 2 (which would
+    masquerade as a Stop block Grok won't honor). A Stop/PostToolUse FAIL thus
+    surfaces as advisory, not enforcement, on Grok (KTD-9: "Stop does not gate the
+    agent on Grok"); enforcement on Grok lives solely on PreToolUse.
+    """
+    if event == "PreToolUse":
+        if canonical.permission_decision:
+            wire: dict = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": canonical.permission_decision,
+                }
+            }
+            if canonical.permission_decision_reason is not None:
+                wire["hookSpecificOutput"]["permissionDecisionReason"] = (
+                    canonical.permission_decision_reason
+                )
+            return wire, 0
+        # No permission_decision but a systemMessage -> the deny-loop breaker
+        # tripped (respond_pretooluse fell through to ALLOW + advisory note).
+        # Grok HONORS PreToolUse stdout, so deliver the note here rather than
+        # dropping it; no permissionDecision means the edit is still allowed.
+        if canonical.systemMessage:
+            return {"systemMessage": canonical.systemMessage}, 0
+        # Allow / no-op: quiet (let the host's own permission prompt run).
+        return None, 0
+
+    # Passive / post / Stop: advisory only. Log the richest available feedback
+    # (the dropped additionalContext text and any Stop/UNCERTAIN reason are
+    # preserved IN THE LOG even though they never reach stdout), then surface a
+    # best-effort systemMessage on stdout (Grok may show it; the log is the
+    # guaranteed record).
+    advisory = canonical.additionalContext or canonical.reason or canonical.systemMessage
+    # The advisory log is a DIAGNOSTIC delivery channel, NOT keyed state like the
+    # fail-state file — so it does not need a guaranteed session_id (unlike the
+    # /tmp fail/deny files, which key on it). The render boundary's shared
+    # signature `_render_host_output(host, result, event)` is co-edited by the
+    # other host units, so it is left UNCHANGED here (no merge conflict): we read
+    # session_id from the responder dict when it carries one (Stop bodies do via
+    # their state writes; most post-event responders don't), else fall back to the
+    # `nosession` bucket inside _grok_advisory_log. A single readable advisory log
+    # is fully sufficient for the post/Stop delivery KTD-9 requires.
+    raw = canonical.raw if isinstance(canonical.raw, dict) else {}
+    session_id = raw.get("session_id", "")
+    _grok_advisory_log(session_id, event, advisory or "")
+
+    if canonical.systemMessage:
+        # Best-effort user-visible advisory; deliberately NO additionalContext
+        # (the channel Grok drops on these events) and exit 0 (never a block).
+        return {"systemMessage": canonical.systemMessage}, 0
+    return None, 0
+
+
+# ---------------------------------------------------------------------------
 # Host seam (Axis B / U7 / KTD-7) — two symmetric seams + a canonical schema
 # ---------------------------------------------------------------------------
 #
@@ -2336,8 +2479,9 @@ def _render_host_output(
     review. The canonical lift happens here so every host sees the same schema.
     """
     canonical = _to_canonical(result, event)
-    # grok / antigravity renderers land in U10 / U11. Clean extension point:
-    #   if host == "grok":        return _render_grok_output(canonical, event)
+    if host == "grok":
+        return _render_grok_output(canonical, event)
+    # antigravity renderer lands in U11. Clean extension point:
     #   if host == "antigravity": return _render_antigravity_output(canonical, event)
     return _render_identity_output(canonical, event)
 
@@ -2395,8 +2539,10 @@ def _normalize_input(host: str, hook_data: dict) -> dict:
     """
     if host == "cursor":
         return _normalize_cursor_input(hook_data)
-    if host in ("grok", "antigravity"):
-        debug(f"no {host} input normalizer yet (U10/U11); identity passthrough")
+    if host == "grok":
+        return _normalize_grok_input(hook_data)
+    if host == "antigravity":
+        debug(f"no {host} input normalizer yet (U11); identity passthrough")
     return hook_data
 
 
@@ -3758,10 +3904,19 @@ def run_self_test() -> None:
             ).get("hook_event_name"),
             "PostToolUse",
         )
-        # grok/antigravity have no normalizer yet -> identity passthrough (U10/U11).
+        # grok dispatch delegates to _normalize_grok_input; an already-Claude-shaped
+        # payload (no camelCase envelope keys, cwd present) passes through unchanged.
         check(
-            "grok input dispatch is identity passthrough (U10)",
-            _normalize_input("grok", dict(_claude_in)),
+            "grok input dispatch maps event name",
+            _normalize_input(
+                "grok", {"hookEventName": "PreToolUse", "cwd": "/w"}
+            ).get("hook_event_name"),
+            "PreToolUse",
+        )
+        # antigravity has no normalizer yet -> identity passthrough (U11).
+        check(
+            "antigravity input dispatch is identity passthrough (U11)",
+            _normalize_input("antigravity", dict(_claude_in)),
             _claude_in,
         )
 
@@ -3825,6 +3980,164 @@ def run_self_test() -> None:
             )
         finally:
             shutil.which = _real_which  # type: ignore[assignment]
+
+        # --- Grok host: input normalizer + advisory/deny renderer (U10/KTD-9) ---
+        print("\n=== Grok Host (U10) ===")
+
+        # 1. _normalize_grok_input maps the camelCase envelope -> Claude-shaped.
+        # CLAUDE_PROJECT_DIR is exercised as the cwd fallback (Grok sets it), so
+        # save/restore it locally to keep the test hermetic.
+        _saved_cpd = os.environ.get("CLAUDE_PROJECT_DIR")
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        try:
+            _grok_in = _normalize_grok_input(
+                {
+                    "hookEventName": "PreToolUse",
+                    "workspaceRoot": "/repo",
+                    "sessionId": "g123",
+                    "tool_name": "Edit",
+                }
+            )
+            check("grok normalize: hookEventName -> hook_event_name",
+                  _grok_in.get("hook_event_name"), "PreToolUse")
+            check("grok normalize: workspaceRoot -> cwd", _grok_in.get("cwd"), "/repo")
+            check("grok normalize: sessionId -> session_id",
+                  _grok_in.get("session_id"), "g123")
+            # CLAUDE_PROJECT_DIR fallback when no workspaceRoot is present.
+            os.environ["CLAUDE_PROJECT_DIR"] = "/proj"
+            _grok_cpd = _normalize_grok_input(
+                {"hookEventName": "Stop", "conversationId": "c9"}
+            )
+            check("grok normalize: CLAUDE_PROJECT_DIR cwd fallback",
+                  _grok_cpd.get("cwd"), "/proj")
+            check("grok normalize: conversationId -> session_id",
+                  _grok_cpd.get("session_id"), "c9")
+            # Idempotent on an already-Claude-shaped payload (existing fields win).
+            _grok_id = _normalize_grok_input(
+                {"hook_event_name": "Stop", "cwd": "/x", "session_id": "s"}
+            )
+            check("grok normalize: idempotent on Claude-shaped input",
+                  _grok_id, {"hook_event_name": "Stop", "cwd": "/x", "session_id": "s"})
+        finally:
+            if _saved_cpd is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = _saved_cpd
+
+        # 2. PreToolUse FAIL/deny canonical -> permissionDecision on stdout (the
+        # ONE channel Grok honors). This is the real hard-block (INV-DENY-STDOUT).
+        _deny_dict = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Grok blocked this edit:\nrce",
+            }
+        }
+        _grok_pre, _grok_pre_exit = _render_host_output("grok", _deny_dict, "PreToolUse")
+        check("grok PreToolUse deny emits permissionDecision on stdout",
+              (_grok_pre or {}).get("hookSpecificOutput", {}).get("permissionDecision"),
+              "deny")
+        check("grok PreToolUse deny carries the reason",
+              (_grok_pre or {}).get("hookSpecificOutput", {}).get("permissionDecisionReason"),
+              "Grok blocked this edit:\nrce")
+        check("grok PreToolUse deny exits 0 (stdout, never exit 2)", _grok_pre_exit, 0)
+        # PreToolUse allow (None responder) -> nothing printed, no auto-approve.
+        check("grok PreToolUse allow renders (None, 0)",
+              _render_host_output("grok", None, "PreToolUse"), (None, 0))
+        # Deny-loop breaker: respond_pretooluse falls through to ALLOW + advisory
+        # systemMessage (NO permission_decision). Grok HONORS PreToolUse stdout, so
+        # the note must be delivered there, not dropped — and still no deny, so the
+        # edit is allowed. This path is most reachable on Grok (gate forced on).
+        _breaker = {"systemMessage": "pre-edit gate allowing now to avoid a deny loop"}
+        _grok_brk, _grok_brk_exit = _render_host_output("grok", _breaker, "PreToolUse")
+        check("grok PreToolUse deny-loop note surfaces systemMessage on stdout",
+              (_grok_brk or {}).get("systemMessage"),
+              "pre-edit gate allowing now to avoid a deny loop")
+        check("grok PreToolUse deny-loop note carries NO permissionDecision (allow)",
+              (_grok_brk or {}).get("hookSpecificOutput"), None)
+        check("grok PreToolUse deny-loop note exits 0", _grok_brk_exit, 0)
+
+        # 3. Passive/post/Stop FAIL canonical -> side channel, NOT stdout
+        # additionalContext. Point STATE_DIR at a scratch dir so the assertion is
+        # hermetic, then confirm the verdict is NOT in stdout additionalContext.
+        global STATE_DIR
+        _saved_state_dir = STATE_DIR
+        _tmp_state = tempfile.mkdtemp(prefix="grok-advisory-test-")
+        try:
+            STATE_DIR = Path(_tmp_state)
+            # A PostToolUse FAIL responder dict (dual-channel: systemMessage +
+            # additionalContext) — exactly what Grok DROPS on stdout post-event.
+            # NOTE: this fixture INJECTS session_id to exercise the keyed-bucket
+            # branch, but PRODUCTION responders (respond_code_review / respond_stop
+            # / ...) do NOT echo session_id into their wire dict — so in practice
+            # every advisory lands in the `nosession` bucket (asserted below). The
+            # advisory log is a diagnostic delivery channel, not keyed state, so a
+            # single readable bucket is sufficient (see _render_grok_output).
+            _post_fail = {
+                "session_id": "gsess",
+                "systemMessage": "Reflector FAIL [x.py]: bad",
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": "Review FAIL [x.py]: security hole",
+                },
+            }
+            _grok_post, _grok_post_exit = _render_host_output(
+                "grok", _post_fail, "PostToolUse"
+            )
+            # The verdict text must NOT ride stdout additionalContext (Grok drops it).
+            check("grok PostToolUse advisory has NO additionalContext on stdout",
+                  (_grok_post or {}).get("hookSpecificOutput"), None)
+            check("grok PostToolUse advisory never exits 2 (advisory, not block)",
+                  _grok_post_exit, 0)
+            # best-effort systemMessage survives (user-visible advisory).
+            check("grok PostToolUse advisory keeps best-effort systemMessage",
+                  (_grok_post or {}).get("systemMessage"), "Reflector FAIL [x.py]: bad")
+            # The dropped feedback is preserved IN THE SIDE-CHANNEL LOG.
+            _adv_log = STATE_DIR / "codex-reflector-grok-advisory-gsess.log"
+            check("grok PostToolUse advisory written to side-channel log",
+                  _adv_log.exists(), True)
+            _adv_text = _adv_log.read_text(encoding="utf-8") if _adv_log.exists() else ""
+            check("grok side-channel log contains the dropped additionalContext",
+                  "security hole" in _adv_text, True)
+
+            # A Stop BLOCK canonical (decision=block/_exit=2) must NOT exit 2 on
+            # Grok (it would masquerade as a block Grok won't honor) — it degrades
+            # to advisory: log + best-effort systemMessage, exit 0 (KTD-9).
+            _stop_block = {
+                "session_id": "gsess",
+                "decision": "block",
+                "reason": "Stop Review FAIL:\nunresolved issue",
+                "systemMessage": "Stop: unresolved FAIL",
+                "_exit": 2,
+            }
+            _grok_stop, _grok_stop_exit = _render_host_output("grok", _stop_block, "Stop")
+            check("grok Stop block degrades to exit 0 (advisory, not enforced)",
+                  _grok_stop_exit, 0)
+            check("grok Stop advisory emits no hookSpecificOutput (Stop schema-safe)",
+                  (_grok_stop or {}).get("hookSpecificOutput"), None)
+            check("grok Stop advisory logs the dropped reason",
+                  "unresolved issue" in _adv_log.read_text(encoding="utf-8"), True)
+
+            # PRODUCTION REALITY: a responder dict with NO session_id (the actual
+            # respond_* shape) writes to the `nosession` bucket — proving the test
+            # above isn't asserting per-session files that won't exist in practice.
+            _prod_fail = {
+                "systemMessage": "Reflector FAIL [y.py]: bad",
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": "Review FAIL [y.py]: data loss",
+                },
+            }
+            _render_host_output("grok", _prod_fail, "PostToolUse")
+            _nosess_log = STATE_DIR / "codex-reflector-grok-advisory-nosession.log"
+            check("grok advisory without session_id lands in nosession bucket",
+                  _nosess_log.exists(), True)
+            check("grok nosession log captures the dropped feedback",
+                  "data loss" in (_nosess_log.read_text(encoding="utf-8")
+                                  if _nosess_log.exists() else ""), True)
+        finally:
+            STATE_DIR = _saved_state_dir
+            shutil.rmtree(_tmp_state, ignore_errors=True)
     finally:
         # Restore env exactly as it was.
         for k, v in _saved_env.items():

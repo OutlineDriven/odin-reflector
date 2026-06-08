@@ -28,6 +28,20 @@ Cursor can run this repo through its Claude Code third-party hooks compatibility
 - Cursor does not currently map Claude `PostToolUseFailure`; that hook remains exported for Claude parity but may not fire in Cursor.
 - Cursor treats Claude `Stop` blocks as follow-up messages, so unresolved FAIL reviews continue the agent with Codex feedback instead of hard-stopping the Cursor UI.
 
+## Grok host compatibility (U10 / KTD-9)
+
+Grok (xAI CLI, snapshot `grok 0.2.33`) runs this repo through its Claude-compat hook discovery: it scans `~/.claude/settings.json`, sets `CLAUDE_PROJECT_DIR`, and sends Claude-shaped stdin (camelCase envelope).
+
+- `scripts/install-grok.sh` installs the wiring (mirrors `install-cursor.sh`) and adds two Grok specifics: a **`PreToolUse`** hook entry, and **`REFLECTOR_PREEDIT_BLOCK=1` enabled UNCONDITIONALLY** (prefixed on every hook command, alongside `REFLECTOR_HOST=grok`). `PreToolUse` is Grok's ONLY hard-block path, so the pre-edit gate is always on for Grok (opt-in everywhere else).
+- `_normalize_grok_input()` is minimal: `hookEventName`→`hook_event_name`, `workspaceRoot`/`workspaceRoots[0]`/`$CLAUDE_PROJECT_DIR`→`cwd`, `sessionId`/`conversationId`→`session_id`. Idempotent on already-Claude-shaped input.
+- `_render_grok_output()` is asymmetric (KTD-9). **`PreToolUse`**: emits `hookSpecificOutput.permissionDecision="deny"` on stdout (a REAL hard-block — the one channel Grok honors). **post/Stop/PreCompact**: Grok DROPS stdout there, so these are ADVISORY — the feedback is logged to a side channel (`/tmp/codex-reflector-grok-advisory-{session}.log`) plus a best-effort `systemMessage`, NEVER `additionalContext`, and NEVER exit 2. A Stop FAIL therefore does not gate the agent on Grok; enforcement lives solely on `PreToolUse`.
+
+**Firing + blocking smoke test (KTD-10 gate; run live, not offline-testable).** The host adapter ships per KTD-10, but the exact Grok deny wire-shape is smoke-test-gated — if it diverges, `_render_grok_output()` is the single mapping point.
+1. `grok --version` → confirm the binary (snapshot `0.2.33`).
+2. `scripts/install-grok.sh <scratch-repo>` then `cd <scratch-repo> && grok inspect --json` → confirm Grok discovers the 5 hooks (incl. `PreToolUse`).
+3. In the scratch repo, `grok -p "edit <file> to add an obviously dangerous change"` → confirm a Claude-compat hook fires under `grok -p` AND that Grok honors `permissionDecision="deny"` on `PreToolUse` by denying the real edit (the file is unchanged).
+4. Confirm a post/Stop FAIL is NOT injected into Grok's context (advisory only) but DOES appear in the `/tmp/codex-reflector-grok-advisory-*.log` side channel.
+
 ## Architecture
 
 Single-file plugin: `scripts/codex-reflector.py` (~1165 LOC).
