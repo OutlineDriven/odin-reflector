@@ -95,6 +95,14 @@ fi
 hooks_dir=$(dirname -- "$hooks_path")
 mkdir -p "$settings_dir" "$hooks_dir"
 
+# Re-resolve to absolute now the dirs exist: a relative --hooks-path / AGY_HOOKS
+# would otherwise bake a relative path into the wrapper's hook_command, which
+# breaks when agy runs the hook from its own cwd (mirrors install-codex.sh).
+settings_dir=$(CDPATH='' cd -- "$settings_dir" && pwd -P)
+hooks_dir=$(CDPATH='' cd -- "$hooks_dir" && pwd -P)
+settings_path="${settings_dir}/$(basename -- "$settings_path")"
+hooks_path="${hooks_dir}/$(basename -- "$hooks_path")"
+
 # Generate a WRAPPER that exports REFLECTOR_HOST=antigravity then execs the
 # reflector (mirrors install-codex.sh). Env-setting lives in the wrapper, NOT as
 # an inline `VAR=val cmd` prefix in the hook command, so host-pinning does not
