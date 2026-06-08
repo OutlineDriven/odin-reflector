@@ -1832,6 +1832,25 @@ def _compact_output(text: str, cwd: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _apply_verdict_state(
+    session_id: str,
+    verdict: str,
+    tool_name: str,
+    key: str,
+    raw_output: str,
+    host: str,
+) -> None:
+    # UNCERTAIN: no state change (preserves prior FAIL if any). This is the one
+    # owner of the verdict->fail-state mapping shared by all three review
+    # responders (INV: "UNCERTAIN preserves prior state" must not drift).
+    # Calls write_fail_state/clear_fail_state by global name so the self-test's
+    # module-scope monkeypatch still intercepts them.
+    if verdict == "FAIL":
+        write_fail_state(session_id, tool_name, key, raw_output, host)
+    elif verdict == "PASS":
+        clear_fail_state(session_id, key, host)
+
+
 def respond_code_review(
     session_id: str,
     tool_name: str,
@@ -1850,11 +1869,7 @@ def respond_code_review(
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
 
-    if verdict == "FAIL":
-        write_fail_state(session_id, tool_name, file_path, raw_output, host)
-    elif verdict == "PASS":
-        clear_fail_state(session_id, file_path, host)
-    # UNCERTAIN: no state change (preserves prior FAIL if any)
+    _apply_verdict_state(session_id, verdict, tool_name, file_path, raw_output, host)
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"{label} Reflector {prefix} [{file_path}]:\n{raw_output}"
@@ -1910,11 +1925,7 @@ def respond_plan_review(
         verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
 
-    if verdict == "FAIL":
-        write_fail_state(session_id, "ExitPlanMode", plan_path, raw_output, host)
-    elif verdict == "PASS":
-        clear_fail_state(session_id, plan_path, host)
-    # UNCERTAIN: no state change (preserves prior FAIL if any)
+    _apply_verdict_state(session_id, verdict, "ExitPlanMode", plan_path, raw_output, host)
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"{label} Plan Review {prefix} [{plan_path}]:\n{raw_output}"
@@ -1943,11 +1954,7 @@ def respond_subagent_review(
         verdict = parse_verdict(raw_output)
     raw_output = _compact_output(raw_output, cwd)
 
-    if verdict == "FAIL":
-        write_fail_state(session_id, "SubagentStop", agent_type, raw_output, host)
-    elif verdict == "PASS":
-        clear_fail_state(session_id, agent_type, host)
-    # UNCERTAIN: no state change (preserves prior FAIL if any)
+    _apply_verdict_state(session_id, verdict, "SubagentStop", agent_type, raw_output, host)
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"{label} Subagent Review {prefix}:\n{raw_output}"
