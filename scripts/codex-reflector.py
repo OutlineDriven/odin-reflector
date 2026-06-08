@@ -886,10 +886,12 @@ def invoke_backend(
     """
     out_fd = out_path = None
     prompt_path = None
-    if backend.output_capture == "file":
-        out_fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex-ref-")
-        os.close(out_fd)
     try:
+        if backend.output_capture == "file":
+            # Inside the try so a tmpfile OSError (e.g. disk full) fails open
+            # ('') like every other I/O failure here, not crashes the caller.
+            out_fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex-ref-")
+            os.close(out_fd)
         argv = _build_backend_argv(backend, model, effort, out_path or "")
 
         # Prompt delivery
@@ -1064,6 +1066,19 @@ def _backend_call_model(name: str, spec: Backend, model: str) -> str:
     return spec.default_model
 
 
+def _future_raw(future: "concurrent.futures.Future") -> str:
+    """fan_out worker result, fail-open. A worker exception invoke_backend did
+    NOT already convert to '' (e.g. an mkstemp error on a platform whose
+    PermissionError escapes the OSError catch) becomes infra-empty here, so one
+    backend can never discard the others' verdicts nor crash the hook (which on
+    a fail-closed Stop would silently invert it to fail-open)."""
+    try:
+        return future.result()
+    except Exception as exc:  # noqa: BLE001 - last-resort fail-open backstop
+        debug(f"fan_out worker error: {exc}")
+        return ""
+
+
 def fan_out(
     prompt: str,
     cwd: str,
@@ -1102,7 +1117,7 @@ def fan_out(
                     spec,
                 )
             )
-        return [(name, f.result()) for name, f in zip(backends, futures)]
+        return [(name, _future_raw(f)) for name, f in zip(backends, futures)]
 
 
 def format_reviewer_blocks(results: list[tuple[str, str]]) -> str:
@@ -3425,6 +3440,27 @@ def run_self_test() -> None:
                 "fan_out grok forced to default_model",
                 _per["grok"],
                 (BACKENDS["grok"].default_model, "high"),
+            )
+
+            # N>1 fails OPEN per worker: a raising backend becomes infra-empty
+            # ('') rather than crashing the hook and discarding the OTHER
+            # backends' verdicts (which on a fail-closed Stop would invert it).
+            def _raise_grok(prompt, cwd, effort, model, backend):
+                if backend.bin == "grok":
+                    raise RuntimeError("boom")
+                return f"PASS from {backend.bin}"
+
+            globals()["invoke_backend"] = _raise_grok
+            n3 = fan_out("p", "/c", "high", "model-X", ["codex", "grok"])
+            check(
+                "fan_out N>1 raising worker -> infra-empty, others survive",
+                n3,
+                [("codex", "PASS from codex"), ("grok", "")],
+            )
+            check(
+                "fan_out raising worker excluded by merge (-> PASS, not crash/UNCERTAIN)",
+                merge_verdicts(n3),
+                "PASS",
             )
         finally:
             globals()["invoke_backend"] = _real_invoke
