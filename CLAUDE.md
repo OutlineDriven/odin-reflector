@@ -2,6 +2,8 @@
 
 Claude Code plugin that routes hook events to an independent second-model reviewer for critique. Default reviewer is OpenAI Codex CLI; `claude`, `cursor-agent`, `grok`, and `agy` (Antigravity) are selectable and stackable (fan-out). Runs across 5 hosts (claude/codex/cursor/grok/antigravity).
 
+Past solutions & learnings live in `docs/solutions/` — documented bugs, security findings, and patterns by category, each with YAML frontmatter (`module`, `tags`, `problem_type`). Search it before debugging a recurring issue.
+
 ## Commands
 
 ```bash
