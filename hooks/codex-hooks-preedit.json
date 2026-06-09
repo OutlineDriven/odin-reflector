@@ -1,0 +1,18 @@
+{
+  "description": "OPT-IN pre-edit hard-block fragment for codex-reflector on Codex (KTD-12). NOT wired by default: install-codex.sh merges this only with --preedit. Routes PreToolUse through hooks/codex-reflector-preedit-hook.sh, which exports REFLECTOR_HOST=codex + REFLECTOR_PREEDIT_BLOCK=1 then execs the reflector. This hook forks python3 on every matched edit BEFORE it lands, so it is kept out of the default codex-hooks.json (mirrors fix M-A: PreToolUse is absent from committed hooks/hooks.json). respond_pretooluse still self-gates on REFLECTOR_PREEDIT_BLOCK and returns None when off.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Patch|NotebookEdit|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/codex-reflector-preedit-hook.sh\"",
+            "timeout": 60,
+            "statusMessage": "Codex reflector: pre-edit review (opt-in)"
+          }
+        ]
+      }
+    ]
+  }
+}
