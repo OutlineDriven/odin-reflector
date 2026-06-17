@@ -1,136 +1,53 @@
-# Codex Reflector
+# Codex Reflector Agent Notes
 
-Claude Code plugin that routes hook events to OpenAI Codex CLI for independent second-model review.
+This file is only for repo-specific constraints that are easy to break and expensive to rediscover. README owns installation and user-facing usage; do not duplicate it here.
 
-## Commands
+## Surface split
 
-```bash
-# Self-test (verdict parser + plan path extraction + synthetic path guards + Cursor normalization)
-python3 scripts/codex-reflector.py --test-parse
+- **Rule:** Treat the repository as two hook surfaces, not one implementation. The Claude/Cursor plugin is `scripts/codex-reflector.py` wired by `hooks/hooks.json`; the oh-my-pi port is `omp/codex-reflector.ts` loaded through `package.json` `omp.extensions`.
+  **Why:** Both surfaces call `codex exec` and expose the same reflector idea, but their hook delivery, state persistence, and stop-enforcement mechanisms differ. Editing the wrong surface fixes nothing.
 
-# Lint
-ruff check scripts/codex-reflector.py
+- **Rule:** For shared behavior changes, check both surfaces before declaring parity: verdict parsing, prompt builders, redaction/sandboxing, fail-state semantics, model/effort gating, and changed-file target resolution.
+  **Why:** The TypeScript file is a native port of the Python hook, while the OMP tests codify port-specific contracts. Silent drift produces different review outcomes for Claude/Cursor vs OMP users.
 
-# Debug mode (stderr diagnostics)
-CODEX_REFLECTOR_DEBUG=1
-```
+## Python Claude/Cursor plugin invariants
 
-No build step. No pip dependencies — stdlib only.
+- **Rule:** Keep `hooks/hooks.json` as routing glue and keep real classification in `classify()` inside `scripts/codex-reflector.py`. Cursor-specific matcher generation belongs in `scripts/install-cursor.sh`, not in the core dispatch path.
+  **Why:** Claude and Cursor expose different hook payloads and matcher behavior. A duplicated routing table becomes a drift source; the Python script normalizes payloads and owns the routing decision.
 
-## Cursor third-party compatibility
+- **Rule:** Python blocking is exit-code based. Advisory reviews exit `0` with JSON; Stop blocks by returning `decision: "block"`/`_exit: 2`, which `main()` emits on stderr before exiting `2`.
+  **Why:** Claude consumes exit `2` stderr as blocking context. Treating Stop like PostToolUse JSON feedback either fails schema validation or silently approves work that should block.
 
-Cursor can run this repo through its Claude Code third-party hooks compatibility layer.
+- **Rule:** `hookSpecificOutput` is only for events whose schema accepts it (`PostToolUse`, `PostToolUseFailure`, `PreToolUse`, `UserPromptSubmit`). Stop must use `systemMessage` or `decision`/`reason`; PreCompact must use `systemMessage`.
+  **Why:** Stop/PreCompact reject `hookSpecificOutput`; putting it there breaks the hook response instead of injecting useful context.
 
-- `.claude/settings.json` is the direct-export hook wiring Cursor reads. It mirrors the 4 plugin events and uses `CLAUDE_PROJECT_DIR` for this checkout.
-- `scripts/install-cursor.sh` installs the same wiring into `~/.claude/settings.json` or `<project>/.claude/settings.json` with absolute paths for cross-project use.
-- `_normalize_cursor_input()` is the only Cursor-specific adapter. It maps Cursor event names, `conversation_id`, `workspace_roots`, `tool_output`, `Shell` failures, and Stop `loop_count` into the Claude-shaped fields the existing router expects.
-- Cursor accepts Claude's nested `hookSpecificOutput` response format, so output builders stay Claude-shaped.
-- Cursor does not currently map Claude `PostToolUseFailure`; that hook remains exported for Claude parity but may not fire in Cursor.
-- Cursor treats Claude `Stop` blocks as follow-up messages, so unresolved FAIL reviews continue the agent with Codex feedback instead of hard-stopping the Cursor UI.
+- **Rule:** Parse verdicts from raw Codex output before any compaction in every responder that branches on PASS/FAIL/UNCERTAIN.
+  **Why:** Compaction can remove or rewrite the verdict line. A buried or stripped verdict becomes UNCERTAIN and changes fail-open/fail-closed behavior.
 
-## Architecture
+- **Rule:** Python FAIL state is per session and per target file, guarded by `fcntl.flock`. FAIL records state, PASS clears it, and UNCERTAIN must not mutate it. Stop first blocks on unresolved recorded FAILs; a Stop-review UNCERTAIN is fail-closed and blocks.
+  **Why:** Individual reviews are advisory, but Stop is the accumulation checkpoint. Clearing state on UNCERTAIN hides unresolved FAILs from that checkpoint.
 
-Single-file plugin: `scripts/codex-reflector.py` (~1165 LOC).
+- **Rule:** Keep Cursor payload adaptation contained in `_normalize_cursor_input()` and generated settings from `scripts/install-cursor.sh`.
+  **Why:** Cursor compatibility maps event names and fields into Claude-shaped hook data. Scattering Cursor field handling through responders makes every future hook change harder to audit.
 
-`hooks/hooks.json` routes 4 events (`PostToolUse`, `PostToolUseFailure` (async), `Stop`, `PreCompact`) to the same Python script. All dispatch logic is in Python via `classify()` and event matching in `main()`.
+## OMP native extension invariants
 
-### Data flow
+- **Rule:** The OMP surface is a default-export hook factory. `CODEX_REFLECTOR_ENABLED=0` must register no handlers.
+  **Why:** OMP loads the extension through the manifest/factory contract; the kill switch must be safe even when the package is present.
 
-```
-stdin JSON → classify() → _gate_model_effort() → build_*_prompt() → invoke_codex() → parse_verdict() → respond_*() → exit 0/2
-```
+- **Rule:** On successful `tool_result` reviews, return a `content` override. On tool error paths, send diagnostics with `pi.sendMessage()` and return `undefined`.
+  **Why:** OMP rethrows tool errors. Overriding error results would corrupt the harness error path instead of preserving the original failure.
 
-## Key patterns
+- **Rule:** OMP FAIL state lives in `FailTracker` and is replayed from `codex-reflector-fail` custom entries. Open per-file generation tokens before awaiting Codex; drop a combined review if any target path has gone stale; dedupe multi-file `ast_edit` paths.
+  **Why:** Reviews race with later edits. Per-path generations prevent old Codex output from overwriting newer state, and deduping avoids self-superseding a single edit.
 
-### Exit code protocol
+- **Rule:** Do not port Python's exit-2 Stop veto into OMP. OMP enforces unresolved FAILs and Stop-review FAIL/UNCERTAIN through bounded `agent_end` follow-up messages (`REENGAGE_CAP`).
+  **Why:** OMP has no Claude Stop stderr veto path; re-engagement is the enforcement channel, and the cap prevents infinite loops.
 
-| Exit | Meaning | Output channel |
-|:-----|:--------|:---------------|
-| 0 | Success — JSON processed by Claude Code | stdout (JSON with `systemMessage` + `hookSpecificOutput`) |
-| 2 | Blocking — stderr text fed to Claude as context | stderr (plain text) |
-| Other | Non-blocking error — continues silently | stderr (debug only) |
+- **Rule:** Pre-compaction reflection is advisory only.
+  **Why:** The hook should surface metacognition before compaction without mutating the compaction operation or session state.
 
-### `_exit` routing key
+## Safety invariants
 
-Response dicts may use `_exit: 2` for blocking decisions (Stop FAIL/UNCERTAIN). `main()` strips `_exit` before output. If a dict has `decision: "block"` without `_exit`, it defaults to exit 2.
-
-### Dual-channel output
-
-Review responses use dual-channel output for FAIL/UNCERTAIN verdicts:
-- `systemMessage`: shown to the user as a notification
-- `hookSpecificOutput.additionalContext`: injected into Claude's context so it can self-correct
-
-PASS verdicts use `systemMessage` only. FAIL/UNCERTAIN verdicts exit 0 with JSON (not exit 1), ensuring feedback reaches both user and agent.
-
-### Deferred feedback strategy
-
-Individual review FAIL/UNCERTAIN results are delivered as non-blocking feedback (exit 0 with `systemMessage` + `additionalContext`). FAILs are additionally recorded to `/tmp/codex-reflector-fails-{session_id}.json` with `fcntl.flock` for safe concurrent access. At `Stop`, accumulated FAILs block with exit 2, surfacing all unresolved issues.
-
-### Stop hook behavior
-
-- **Loop prevention**: if `stop_hook_active` is true, immediately returns None (exit 0)
-- **Pending FAILs**: fast path — blocks without invoking Codex
-- **Context**: uses `last_assistant_message` when available, falls back to transcript tail
-- **Transcript review**: invokes Codex for holistic review
-- **Fail-closed for UNCERTAIN**: unlike individual reviews, Stop blocks on UNCERTAIN verdicts
-
-### Security
-
-- `_redact()` strips API keys, tokens, private keys, AWS credentials before sending to Codex
-- `_sandbox_content()` wraps untrusted data in `<untrusted-data>` XML tags with ignore-instructions directive
-- Plan path validation: confined to `~/.claude/plans/*.md`, rejects traversal attempts
-
-### Truncation and compaction
-
-- `_matryoshka_compact()`: triggers at `MAX_COMPACT_CHARS` (400K chars). Recursive semantic summarization via FAST_MODEL (up to 3 layers), fail-open to truncation
-- `_compact_output()`: triggers on verbose Codex output (>1500 chars). Re-summarizes output via FAST_MODEL
-- Both fail-open (return original text on Codex failure)
-
-### Environment variables
-
-| Variable | Default | Purpose |
-|:---------|:--------|:--------|
-| `CODEX_REFLECTOR_ENABLED` | `"1"` | Set `"0"` to disable entirely |
-| `CODEX_REFLECTOR_MODEL` | — | Override model for all Codex calls |
-| `CODEX_REFLECTOR_DEBUG` | `"0"` | Set `"1"` for stderr diagnostics |
-
-## Invariants
-
-Cross-cutting rules where breaking the coupling silently corrupts state.
-
-### Asymmetric fail semantics
-
-PostToolUse is fail-open: UNCERTAIN → exit 0, non-blocking feedback. Stop is fail-closed: UNCERTAIN → exit 2, blocking. Rationale: individual reviews are advisory; only the Stop accumulation checkpoint blocks.
-
-### Verdict-before-compact ordering
-
-`parse_verdict()` must run BEFORE `_compact_output()` in every `respond_*()` function. Compaction rewrites text via Codex summarization and can strip or reformat verdict lines.
-
-### UNCERTAIN preserves prior state
-
-In `respond_code_review()`, `respond_plan_review()`, and `respond_subagent_review()`, UNCERTAIN is explicitly a no-op for fail-state — it preserves any prior FAIL. Changing this to clear state would hide unresolved FAILs from Stop.
-
-## Gotchas
-
-- **Verdict window**: `parse_verdict()` scans first 5 lines only. Buried verdicts → UNCERTAIN. Prompts must put PASS/FAIL on first line.
-- **Model override precedence**: `CODEX_REFLECTOR_MODEL` env var overrides ALL model selections including adaptive gating.
-- **Fast model effort**: FAST_MODEL (gpt-5.4-mini) has no effort floor — presets control effort directly. LIGHTNING_FAST auto-bumps effort to at least "high" (preserves "xhigh").
-- **Plan path silent rejection**: `_validate_plan_path()` returns None with no error (DEBUG-only). Rejection of one candidate does not prevent review — the 4-level fallback chain may still find a different plan.
-- **Matryoshka recursion**: up to 3 layers, each calls `invoke_codex()` (100s timeout). Worst case: 300s for one compaction.
-- **Stop loop prevention**: `stop_hook_active` flag check at entry. Commented-out SubagentStop block needs same guard if re-enabled.
-- **`_exit` key discipline**: blocking requires `_exit: 2` or `decision: "block"`. Omitting both → silent exit 0 (approves).
-- **hookSpecificOutput event scope**: Only `PostToolUse`, `PostToolUseFailure`, `PreToolUse`, and `UserPromptSubmit` support `hookSpecificOutput` in their JSON output schema. Stop, SubagentStop, PreCompact, and other events reject it with a validation error. Use `systemMessage` for user-visible feedback on those events, and `decision`/`reason` for blocking.
-- **Synthetic plan paths**: Use `synthetic::` prefix (readability only — any string is a valid POSIX filename). Security boundary is `_is_synthetic_path()` runtime checks at I/O boundaries, not the prefix itself. Used as state keys only, never for filesystem I/O.
-
-## Fail-open / fail-closed map
-
-| Path | Behavior | Rationale |
-|:-----|:---------|:----------|
-| `invoke_codex()` timeout/error | fail-open (returns `""`) | Never block on infra failure |
-| `parse_verdict()` empty input | UNCERTAIN | Preserves existing state |
-| PostToolUse UNCERTAIN | exit 0 (non-blocking) | Individual reviews are advisory |
-| Stop UNCERTAIN | exit 2 (blocking) | Checkpoint must be conservative |
-| `_matryoshka_compact()` failure | fail-open (truncates to max_chars) | Degraded but functional |
-| `_validate_plan_path()` invalid | silent rejection of that candidate (fallback continues) | Security boundary |
-| stdin JSON parse error | `sys.exit(0)` | Never block on malformed input |
-
+- **Rule:** Redact secrets before sending prompts to Codex, and keep untrusted tool/transcript data sandboxed where that prompt path supports sandbox wrappers. Keep `codex exec` read-only/ephemeral and fail-open on invocation errors.
+  **Why:** The reflector reviews arbitrary tool output, diffs, shell errors, and transcripts. Codex must not receive credentials, treat untrusted data as instructions, modify the repo, or brick the agent when external infrastructure fails.
