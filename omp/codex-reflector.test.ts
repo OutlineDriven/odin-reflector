@@ -14,6 +14,7 @@ import codexReflector, {
 	renderTranscript,
 	resolveChangeTarget,
 	sandboxContent,
+	stopReviewDecision,
 } from "./codex-reflector.ts";
 
 describe("parseVerdict", () => {
@@ -323,5 +324,20 @@ describe("codeReviewResponse", () => {
 		expect(last.type).toBe("text");
 		expect(last.text).toContain("PASS");
 		expect(last.text).toContain("looks correct");
+	});
+});
+
+describe("stopReviewDecision", () => {
+	test("PASS settles (returns undefined, no block)", () => {
+		expect(stopReviewDecision("PASS", "looks good")).toBeUndefined();
+	});
+	test("FAIL blocks with the review as reason", () => {
+		const r = stopReviewDecision("FAIL", "missing guard");
+		expect(r?.decision).toBe("block");
+		expect(r?.reason).toContain("FAIL");
+		expect(r?.reason).toContain("missing guard");
+	});
+	test("UNCERTAIN settles (returns undefined — never block on uncertainty)", () => {
+		expect(stopReviewDecision("UNCERTAIN", "unsure")).toBeUndefined();
 	});
 });

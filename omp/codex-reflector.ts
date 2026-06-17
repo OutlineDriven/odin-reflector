@@ -831,6 +831,18 @@ export function codeReviewResponse(
 	};
 }
 
+/** Map a holistic Stop-review verdict to its settle decision: only a definitive
+ * FAIL blocks the stop (fail-closed) with the review as the continuation reason
+ * (Claude/Codex-compatible `decision` shape, matching the Python plugin). PASS
+ * and UNCERTAIN settle (fail-open — never block on uncertainty). */
+export function stopReviewDecision(
+	verdict: Verdict,
+	out: string,
+): { decision: "block"; reason: string } | undefined {
+	if (verdict !== "FAIL") return undefined;
+	return { decision: "block", reason: `Codex Stop Review FAIL:\n${out}` };
+}
+
 const VERDICT_PREFIX: Record<Verdict, string> = {
 	FAIL: "\u26a0\ufe0f FAIL",
 	PASS: "\u2713 PASS",
@@ -945,11 +957,13 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			if (!raw) return undefined;
 			const verdict = parseVerdict(raw);
 			const out = await compactOutput(raw, cwd);
-			if (verdict === "PASS") {
+			// PASS / UNCERTAIN settle (display the review); only FAIL blocks.
+			const decision = stopReviewDecision(verdict, out);
+			if (!decision) {
 				pi.sendMessage(
 					{
 						customType: "codex-reflector-stop",
-						content: `Codex Stop Review PASS:\n${out}`,
+						content: `Codex Stop Review ${verdict}:\n${out}`,
 						display: true,
 						attribution: "agent",
 					},
@@ -957,9 +971,8 @@ export default function codexReflector(pi: ExtensionAPI): void {
 				);
 				return undefined;
 			}
-			// FAIL / UNCERTAIN: fail-closed — always continue with the fresh review as context.
 			notifyUI(ctx, `Codex Stop Review ${verdict} — continuing.`, "warning");
-			return { continue: true, additionalContext: `Codex Stop Review ${verdict}:\n${out}` };
+			return decision;
 		} catch (err) {
 			debug(`session_stop handler error: ${String(err)}`);
 			return undefined;

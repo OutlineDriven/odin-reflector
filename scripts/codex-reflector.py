@@ -1188,16 +1188,9 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
             "reason": f"Codex Stop Review FAIL:\n{raw_output}",
             "_exit": 2,
         }
-    if verdict == "PASS":
-        return {
-            "systemMessage": f"Codex Stop Review PASS:\n{raw_output}",
-        }
-    # UNCERTAIN: fail-closed — block
-    debug("stop review UNCERTAIN, blocking (fail-closed)")
+    # PASS / UNCERTAIN: do not block — surface the review and settle (fail-open).
     return {
-        "decision": "block",
-        "reason": f"Codex Stop Review UNCERTAIN:\n{raw_output}",
-        "_exit": 2,
+        "systemMessage": f"Codex Stop Review {verdict}:\n{raw_output}",
     }
 
 
@@ -1511,17 +1504,11 @@ def run_self_test() -> None:
 
     # --- Stateless stop tests ---
     print("\n=== Stateless Stop ===")
-    import glob
-
-    pat = "/tmp/codex-reflector-fails-*.json"
-    before = set(glob.glob(pat))
     r_active = respond_stop({"stop_hook_active": True}, "", "low", DEFAULT_MODEL)
     r_empty = respond_stop({"stop_hook_active": False}, "", "low", DEFAULT_MODEL)
-    no_new_cache = set(glob.glob(pat)) == before
     for desc, ok in [
         ("loop guard returns None", r_active is None),
         ("empty transcript returns None", r_empty is None),
-        ("writes no cache file", no_new_cache),
     ]:
         status = "PASS" if ok else "FAIL"
         print(f"  {status}: {desc}")
