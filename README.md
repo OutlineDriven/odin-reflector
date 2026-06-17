@@ -1,29 +1,67 @@
 # Outline-Driven Development — Reflector
 
-> Codex CLI meta-reflection layer for Outline-Driven Development. Add-on for the Claude Code plugin.
+> Codex CLI meta-reflection layer for Outline-Driven Development. Add-on for the Claude Code plugin, with a native oh-my-pi port.
 
 **Methodology**: [outline-driven-development](https://github.com/OutlineDriven/outline-driven-development) &nbsp;·&nbsp; **Claude Code plugin**: [odin-claude-plugin](https://github.com/OutlineDriven/odin-claude-plugin) &nbsp;·&nbsp; **Site**: [outlinedriven.github.io](https://outlinedriven.github.io)
 
 ---
 
-Independent critic, oracle, and metacognition layer for Claude Code using OpenAI Codex CLI.
+Independent critic, oracle, and metacognition layer using OpenAI Codex CLI.
 
-Claude Code acts. Codex reviews. Every code change gets a second opinion. Every thinking step gets metacognitive reflection from a different model family.
+The agent acts. Codex reviews. Every code change gets a second opinion. Every thinking step gets metacognitive reflection from a different model family.
 
 ## Requirements
 
-- [Codex CLI](https://github.com/openai/codex) on PATH (`codex exec` must work)
-- Python 3.8+ (stdlib only, no pip dependencies)
+- [Codex CLI](https://github.com/openai/codex) on PATH (`codex exec` must work) — required by **both** surfaces.
 
-## Install
+The reflector ships in two surfaces; install whichever matches your agent:
+
+- **[Claude Code plugin](#claude-code-plugin)** — the original single-file Python hook. Needs Python 3.8+ (stdlib only, no pip dependencies).
+- **[oh-my-pi (omp)](#oh-my-pi-omp)** — a native TypeScript port, no Python runtime. Needs the `omp` CLI.
+
+---
+
+## Claude Code plugin
+
+A single-file Python hook (`scripts/codex-reflector.py`, stdlib only) wired through `hooks/hooks.json`. Requires Python 3.8+.
+
+### Install
 
 ```bash
 claude plugin marketplace add OutlineDriven/odin-reflector; claude plugin install codex-reflector@odin-reflector
 ```
 
-### Install as a Cursor Plugin
+### Activation
 
-This repository now includes native Cursor plugin metadata at `.cursor-plugin/plugin.json`.
+Place this plugin at `~/.claude/codex-reflector/` and restart Claude Code.
+
+```
+~/.claude/codex-reflector/
+├── .claude-plugin/plugin.json
+├── hooks/hooks.json
+├── scripts/codex-reflector.py
+├── LICENSE
+├── README.md
+└── .gitignore
+```
+
+### Hook events
+
+| Event | Trigger | Mode | Purpose |
+|---|---|---|---|
+| PostToolUse | Write, Edit, morph-edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
+| PostToolUse | sequential-thinking, actor-critic, shannon | sync | Metacognitive reflection (advisory, no verdict) |
+| PostToolUseFailure | Bash | async | Root cause diagnosis for failed commands |
+| Stop | Agent finishing | sync | Blocks if unresolved FAIL reviews exist |
+| PreCompact | Context compaction | sync | Summarizes critical session context |
+
+### Use with Cursor
+
+Cursor can run this plugin through its Claude Code third-party hooks compatibility layer.
+
+#### Install as a Cursor plugin
+
+This repository includes native Cursor plugin metadata at `.cursor-plugin/plugin.json`.
 
 To install it as a local Cursor plugin, copy or symlink this repository into:
 
@@ -39,9 +77,7 @@ Then reload Cursor. The plugin components are auto-discovered from this reposito
 - `agents/codex-reflector-reviewer.md`
 - `commands/install-cursor-plugin.md`
 
-## Use with Cursor
-
-Cursor can run this plugin through its Claude Code third-party hooks compatibility layer.
+#### Direct-export hooks
 
 1. Enable **Third-party skills** in Cursor Settings.
 2. Install the direct-export Claude settings:
@@ -65,17 +101,81 @@ Cursor compatibility notes:
 - Cursor treats Claude `Stop` blocks as follow-up messages, so unresolved FAIL reviews cause the agent to continue with Codex feedback instead of hard-stopping the UI.
 - The direct export mirrors the Claude plugin matcher. Cursor only fires the parts whose tool names are exposed through its Claude hook compatibility layer.
 
-## Hook Events
+---
 
-| Event | Trigger | Mode | Purpose |
+## oh-my-pi (omp)
+
+A native TypeScript port of this reflector ships at `omp/codex-reflector.ts` — no Python runtime; it calls `codex exec` directly. It registers oh-my-pi hooks that mirror the Claude plugin: code review on `write`/`edit`/`ast_edit` and Fast-Apply MCP edits, root-cause diagnostics on failed `bash` and Fast-Apply calls, metacognitive reflection on thinking-MCP steps (`sequential`, `shannon`), and a pre-compaction session summary.
+
+### Install the omp CLI
+
+Skip if you already have it ([more options](https://omp.sh)):
+
+```sh
+curl -fsSL https://omp.sh/install | sh       # macOS / Linux
+bun install -g @oh-my-pi/pi-coding-agent      # any platform, bun >= 1.3.14
+```
+
+The module is a hook factory (registers via `pi.on`), so it loads through **either** omp surface — pick one.
+
+### Install as a hook
+
+oh-my-pi auto-discovers hooks in `.omp/hooks/` (project) and `~/.omp/hooks/` (user). Symlink the module into one of those, or load it for a single run:
+
+```sh
+mkdir -p ~/.omp/hooks
+ln -s "$(pwd)/omp/codex-reflector.ts" ~/.omp/hooks/codex-reflector.ts
+
+# or, one-off (no install):
+omp --hook "$(pwd)/omp/codex-reflector.ts" -p "…"
+```
+
+### Install as an extension
+
+Register the module through the extension surface — pick one:
+
+- **Manifest** — the checked-in `package.json` declares the hook in its `omp.extensions` field (`./omp/codex-reflector.ts`). Point omp at the repo directory and it resolves the manifest:
+
+  ```sh
+  omp -e /path/to/odin-reflector
+  ```
+
+- **Auto-discovery** — symlink the module into an extension directory, project-local (`<repo>/.omp/extensions/`) or user-global (`~/.omp/agent/extensions/`):
+
+  ```sh
+  mkdir -p ~/.omp/agent/extensions
+  ln -s "$(pwd)/omp/codex-reflector.ts" ~/.omp/agent/extensions/codex-reflector.ts
+  ```
+
+- **Config** — add the absolute path to the `extensions` array in `~/.omp/agent/config.yml`:
+
+  ```yaml
+  extensions:
+    - /path/to/odin-reflector/omp/codex-reflector.ts
+  ```
+
+### Behavior
+
+Reads the same [environment variables](#environment-variables) as the Claude plugin. Run the unit tests with `bun test omp/codex-reflector.test.ts`.
+
+**Behavioral delta from the Claude plugin:** oh-my-pi has no hard Stop-veto, so unresolved FAIL reviews are enforced by **re-engaging the agent** on `agent_end` — a follow-up turn carrying the FAIL list — bounded to 3 re-engagements (the guard resets when a FAIL is cleared or a stop review passes). After the cap, the FAILs are surfaced for manual resolution instead of looping forever.
+
+### Hook events
+
+| omp event | Trigger | Mode | Purpose |
 |---|---|---|---|
-| PostToolUse | Write, Edit, morph-edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
-| PostToolUse | sequential-thinking, actor-critic, shannon | sync | Metacognitive reflection (advisory, no verdict) |
-| PostToolUseFailure | Bash | async | Root cause diagnosis for failed commands |
-| Stop | Agent finishing | sync | Blocks if unresolved FAIL reviews exist |
-| PreCompact | Context compaction | sync | Summarizes critical session context |
+| `tool_result` | `write` / `edit` / `ast_edit`, Fast-Apply MCP edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
+| `tool_result` | `sequential` / `shannon` thinking-MCP steps | sync | Metacognitive reflection (advisory, no verdict) |
+| `tool_result` (`isError`) | failed `bash`, failed Fast-Apply edit | async | Root-cause diagnosis for failed calls |
+| `agent_end` | turn / loop end | sync | Re-engages the agent while unresolved FAILs remain (Stop-hook equivalent) |
+| `session_before_compact` | context compaction | sync | Summarizes critical session context |
+| `session_start` | session start | — | Rebuilds FAIL state from prior session entries |
+
+---
 
 ## Environment Variables
+
+Both surfaces honor the same variables.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -83,21 +183,9 @@ Cursor compatibility notes:
 | `CODEX_REFLECTOR_MODEL` | _(codex default)_ | Override model for `codex exec` |
 | `CODEX_REFLECTOR_DEBUG` | `0` | Set to `1` for stderr diagnostics |
 
-## Activation
-
-Place this plugin at `~/.claude/codex-reflector/` and restart Claude Code.
-
-```
-~/.claude/codex-reflector/
-├── .claude-plugin/plugin.json
-├── hooks/hooks.json
-├── scripts/codex-reflector.py
-├── LICENSE
-├── README.md
-└── .gitignore
-```
-
 ## How It Works
+
+Both surfaces run the same Codex reflection loop. The implementation specifics below (state file, Stop hook, `--test-parse`) describe the Python plugin; the omp port mirrors the same behavior with the [delta noted above](#behavior).
 
 ### Code Reviews (async)
 
@@ -127,14 +215,14 @@ The parser extracts PASS/FAIL from Codex's output:
 - Contradictory signals (both PASS and FAIL) resolve to UNCERTAIN
 - **Fail-open**: UNCERTAIN never blocks
 
-Self-test: `python3 scripts/codex-reflector.py --test-parse`
+Self-test the parser with `python3 scripts/codex-reflector.py --test-parse` (plugin) or `bun test omp/codex-reflector.test.ts` (omp port).
 
 ## Safety
 
-- **Fail-open**: All errors result in `exit 0` (approve). The plugin never blocks Claude due to its own failures.
-- **Read-only sandbox**: Codex runs with `--sandbox read-only` — it cannot modify files.
-- **Infinite loop prevention**: Stop hook checks `stop_hook_active` flag.
-- **Concurrent access**: State file uses `fcntl.flock` for safe concurrent writes.
+- **Fail-open**: any internal error approves silently and never blocks the agent — the Python plugin exits `0`; the omp hook returns without a block.
+- **Read-only sandbox**: Codex runs with `--sandbox read-only` — it cannot modify files (both surfaces).
+- **Loop prevention**: the plugin's Stop hook checks the `stop_hook_active` flag; the omp port bounds re-engagement to 3 follow-ups.
+- **Concurrent state**: the plugin guards its state file with `fcntl.flock`; the omp port persists FAILs as session custom entries through the harness.
 
 ## License
 
