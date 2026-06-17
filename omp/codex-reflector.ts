@@ -30,12 +30,7 @@ import { readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { HookAPI, ToolResultEvent, HookContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
-
-import type {
-	SessionStopEvent,
-	SessionStopEventResult,
-} from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
+import type { ExtensionAPI, ToolResultEvent, ToolResultEventResult } from "@oh-my-pi/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -53,74 +48,11 @@ const CODEX_TIMEOUT_MS = 100_000;
 
 type Effort = "low" | "medium" | "high" | "xhigh";
 type Category = "code_change" | "thinking" | "bash_failure" | "code_change_failure";
-type Verdict = "PASS" | "FAIL" | "UNCERTAIN";
+export type Verdict = "PASS" | "FAIL" | "UNCERTAIN";
 
 interface Preset {
 	model: string;
 	effort: Effort;
-}
-
-export interface FailEntry {
-	tool: string;
-	file: string;
-	feedback: string;
-}
-
-/**
- * Session-scoped FAIL state machine. Pure (no I/O) so it can be unit-tested; the
- * factory wraps it with appendEntry persistence. Tracks per-file FAIL reviews
- * and a per-file review generation so an out-of-order async review cannot apply
- * a stale verdict over a newer one.
- */
-export class FailTracker {
-	private readonly fails = new Map<string, FailEntry>();
-	private readonly generation = new Map<string, number>();
-
-	get size(): number {
-		return this.fails.size;
-	}
-
-	entries(): ReadonlyMap<string, FailEntry> {
-		return this.fails;
-	}
-
-	/** Open a review for `file`; returns the generation token to check on completion. */
-	begin(file: string): number {
-		const next = (this.generation.get(file) ?? 0) + 1;
-		this.generation.set(file, next);
-		return next;
-	}
-
-	/** True while `gen` is still the latest review opened for `file`. */
-	isCurrent(file: string, gen: number): boolean {
-		return this.generation.get(file) === gen;
-	}
-
-	record(file: string, tool: string, feedback: string): void {
-		this.fails.set(file, { tool, file, feedback: feedback.slice(0, 1500) });
-	}
-
-	/** Remove a tracked FAIL. Returns whether one existed. */
-	clear(file: string): boolean {
-		return this.fails.delete(file);
-	}
-
-	/** Replace all state from a replayed append-entry log (fresh map, no carryover). */
-	replay(ops: Iterable<{ op: unknown; file: string; tool?: unknown; feedback?: unknown }>): void {
-		this.fails.clear();
-		this.generation.clear();
-		for (const o of ops) {
-			if (o.op === "set") {
-				this.record(
-					o.file,
-					typeof o.tool === "string" ? o.tool : "",
-					typeof o.feedback === "string" ? o.feedback : "",
-				);
-			} else if (o.op === "clear") {
-				this.fails.delete(o.file);
-			}
-		}
-	}
 }
 
 export interface Routed {
@@ -189,6 +121,19 @@ function debug(msg: string): void {
 		else if (typeof info === "function") (info as (m: string) => void).call(logger, line);
 	} catch {
 		/* logging is best-effort */
+	}
+}
+
+/** Best-effort UI notification: silent in headless mode, never throws. */
+export function notifyUI(
+	ctx: { hasUI: boolean; ui: { notify(msg: string, level?: "info" | "warning" | "error"): void } },
+	msg: string,
+	level: "info" | "warning" | "error",
+): void {
+	try {
+		if (ctx.hasUI) ctx.ui.notify(msg, level);
+	} catch {
+		/* UI is optional */
 	}
 }
 
@@ -868,28 +813,21 @@ async function compactSnippet(rawSnippet: string, cwd: string): Promise<string> 
 }
 
 // ---------------------------------------------------------------------------
-// FAIL state formatting
+// Review response builder
 // ---------------------------------------------------------------------------
 
-export function formatFails(fails: ReadonlyMap<string, FailEntry>): string {
-	const lines: string[] = [];
-	let n = 0;
-	for (const entry of fails.values()) {
-		if (n >= 5) break; // cap at 5
-		n++;
-		lines.push(`- ${entry.tool} [${entry.file}]: ${entry.feedback.slice(0, 300)}`);
-	}
-	return lines.join("\n");
-}
-
-/** Continuation for unresolved per-file FAILs, or undefined to allow the turn to settle. */
-export function stopContinuationForFails(
-	fails: ReadonlyMap<string, FailEntry>,
-): SessionStopEventResult | undefined {
-	if (fails.size === 0) return undefined;
+/** Build the tool_result content override for a code review (all verdicts). */
+export function codeReviewResponse(
+	verdict: Verdict,
+	filePath: string,
+	out: string,
+	baseContent: ToolResultEvent["content"],
+): ToolResultEventResult {
 	return {
-		continue: true,
-		additionalContext: `Unresolved Codex FAIL reviews:\n${formatFails(fails)}`,
+		content: [
+			...baseContent,
+			{ type: "text" as const, text: `Codex Review ${VERDICT_PREFIX[verdict]} [${filePath}]:\n${out}` },
+		],
 	};
 }
 
@@ -903,56 +841,9 @@ const VERDICT_PREFIX: Record<Verdict, string> = {
 // Hook factory
 // ---------------------------------------------------------------------------
 
-export default function codexReflector(pi: HookAPI): void {
+export default function codexReflector(pi: ExtensionAPI): void {
 	if (process.env.CODEX_REFLECTOR_ENABLED === "0") return;
 	logger = pi.logger;
-
-	// Session-scoped FAIL state machine + appendEntry persistence wrapper.
-	const tracker = new FailTracker();
-
-	const writeFail = (file: string, tool: string, feedback: string): void => {
-		const trimmed = feedback.slice(0, 1500);
-		tracker.record(file, tool, trimmed);
-		try {
-			pi.appendEntry("codex-reflector-fail", { op: "set", file, tool, feedback: trimmed });
-		} catch (err) {
-			debug(`appendEntry set failed: ${String(err)}`);
-		}
-	};
-
-	const clearFail = (file: string): void => {
-		if (tracker.clear(file)) {
-			try {
-				pi.appendEntry("codex-reflector-fail", { op: "clear", file });
-			} catch (err) {
-				debug(`appendEntry clear failed: ${String(err)}`);
-			}
-		}
-	};
-
-	// Rebuild FAIL state from prior custom entries on session start (fresh map).
-	pi.on("session_start", (_event, ctx) => {
-		try {
-			const ops: { op: unknown; file: string; tool?: unknown; feedback?: unknown }[] = [];
-			for (const entry of ctx.sessionManager.getEntries()) {
-				if (getProp(entry, "type") !== "custom") continue;
-				if (getProp(entry, "customType") !== "codex-reflector-fail") continue;
-				const data = getProp(entry, "data");
-				const file = getProp(data, "file");
-				if (typeof file !== "string") continue;
-				ops.push({
-					op: getProp(data, "op"),
-					file,
-					tool: getProp(data, "tool"),
-					feedback: getProp(data, "feedback"),
-				});
-			}
-			tracker.replay(ops);
-			debug(`session_start: reconstructed ${tracker.size} fail(s)`);
-		} catch (err) {
-			debug(`session_start reconstruct failed: ${String(err)}`);
-		}
-	});
 
 	// Review code changes / diagnose failures on each tool result.
 	pi.on("tool_result", async (event, ctx) => {
@@ -960,47 +851,19 @@ export default function codexReflector(pi: HookAPI): void {
 			const routed = classify(event.toolName, event.isError ?? false, event.input);
 			if (!routed) return undefined;
 			const cwd = ctx.cwd || process.cwd();
-			const notify = (msg: string, level: string): void => {
-				try {
-					if (ctx.hasUI) ctx.ui.notify(msg, level);
-				} catch {
-					/* UI is optional */
-				}
-			};
 
 			if (routed.category === "code_change") {
-				const { filePath, filePaths, rawSnippet } = resolveChangeTarget(event);
-				// Capture a generation token per state key BEFORE any await (receipt order),
-				// so a later edit of any of these paths supersedes this review for that path.
-				const gens = filePaths.map((p): [string, number] => [p, tracker.begin(p)]);
+				const { filePath, rawSnippet } = resolveChangeTarget(event);
 				const snippet = await compactSnippet(rawSnippet, cwd);
 				const preset = gateModelEffort("code_change", filePath, snippet);
 				const extraFocus = [...fileHeuristics(filePath), ...changeSizeHeuristics(snippet.length)];
 				const prompt = buildCodeReviewPrompt(event.toolName, filePath, snippet, "", extraFocus);
 				const raw = await invokeCodex(prompt, cwd, preset.effort, preset.model);
 				if (!raw) return undefined;
-				// The verdict covers the combined snippet, so it is valid only if EVERY
-				// participating path is still current; if any was superseded, drop it whole.
-				if (gens.some(([p, g]) => !tracker.isCurrent(p, g))) return undefined;
 				const verdict = parseVerdict(raw);
 				const out = await compactOutput(raw, cwd);
-				for (const [key] of gens) {
-					if (verdict === "FAIL") writeFail(key, event.toolName, out);
-					else if (verdict === "PASS") clearFail(key);
-					// UNCERTAIN: no state change (preserves prior FAIL if any).
-				}
-				const prefix = VERDICT_PREFIX[verdict];
-				if (verdict === "FAIL" || verdict === "UNCERTAIN") {
-					notify(`Codex ${verdict} [${filePath}]`, verdict === "FAIL" ? "warning" : "info");
-					return {
-						content: [
-							...event.content,
-							{ type: "text" as const, text: `Codex Review ${prefix} [${filePath}]:\n${out}` },
-						],
-					};
-				}
-				notify(`Codex PASS [${filePath}]`, "info");
-				return undefined;
+				notifyUI(ctx, `Codex ${verdict} [${filePath}]`, verdict === "FAIL" ? "warning" : "info");
+				return codeReviewResponse(verdict, filePath, out, event.content);
 			}
 
 			if (routed.category === "thinking") {
@@ -1071,35 +934,10 @@ export default function codexReflector(pi: HookAPI): void {
 	});
 
 	// session_stop (omp 16.0.5, #2834): main-session-only Stop analog, awaited
-	// before the turn settles, with a native 8-continuation cap. Hook factories
-	// load through the extension runner and receive it at runtime, but HookAPI's
-	// `on` overloads don't list it yet — register the one handler through a typed
-	// view of `pi` (the event lives on the ExtensionAPI surface).
-	type SessionStopRegistrar = {
-		on(
-			event: "session_stop",
-			handler: (
-				event: SessionStopEvent,
-				ctx: HookContext,
-			) => Promise<SessionStopEventResult | undefined> | SessionStopEventResult | undefined,
-		): void;
-	};
-	(pi as unknown as SessionStopRegistrar).on("session_stop", async (event, ctx) => {
+	// before the turn settles, bounded by omp's built-in 8-continuation cap.
+	pi.on("session_stop", async (event, ctx) => {
 		try {
 			const cwd = ctx.cwd || process.cwd();
-
-			// Per-file FAIL enforcement (cheap, no Codex) — runs on every settle attempt.
-			const failCont = stopContinuationForFails(tracker.entries());
-			if (failCont) {
-				ctx.ui.notify("Codex: unresolved FAIL review(s) — continuing.", "warning");
-				return failCont;
-			}
-
-			// Holistic Stop review (Codex) runs on EVERY settle attempt with no
-			// pending per-file FAILs, so the agent is re-evaluated after it continues;
-			// a one-shot review would let a FAIL/UNCERTAIN settle on the next stop.
-			// The native 8-continuation cap bounds the loop.
-
 			const transcript = renderTranscript(toArray(getProp(event, "messages")));
 			if (!transcript) return undefined;
 			const prompt = await buildStopReviewPrompt(transcript, cwd);
@@ -1107,7 +945,6 @@ export default function codexReflector(pi: HookAPI): void {
 			if (!raw) return undefined;
 			const verdict = parseVerdict(raw);
 			const out = await compactOutput(raw, cwd);
-
 			if (verdict === "PASS") {
 				pi.sendMessage(
 					{
@@ -1120,12 +957,12 @@ export default function codexReflector(pi: HookAPI): void {
 				);
 				return undefined;
 			}
-			// FAIL / UNCERTAIN: fail-closed -> continue with the review as context.
-			ctx.ui.notify(`Codex Stop Review ${verdict} — continuing.`, "warning");
+			// FAIL / UNCERTAIN: fail-closed — always continue with the fresh review as context.
+			notifyUI(ctx, `Codex Stop Review ${verdict} — continuing.`, "warning");
 			return { continue: true, additionalContext: `Codex Stop Review ${verdict}:\n${out}` };
 		} catch (err) {
 			debug(`session_stop handler error: ${String(err)}`);
-			return undefined; // fail-open: never trap the agent on a hook failure
+			return undefined;
 		}
 	});
 

@@ -13,7 +13,6 @@ Env vars:
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -22,7 +21,6 @@ import sys
 import tempfile
 from collections import namedtuple
 from pathlib import Path
-from typing import Callable
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -32,7 +30,6 @@ DEBUG = os.environ.get("CODEX_REFLECTOR_DEBUG", "0") == "1"
 MAX_COMPACT_CHARS = (
     400_000  # ~100K tokens at ~4 chars/token — trigger compaction above this
 )
-STATE_DIR = Path("/tmp")
 _SYNTHETIC_PREFIX = (
     "synthetic::"  # Readability convention for non-filesystem path identifiers
 )
@@ -1042,97 +1039,6 @@ Focus on what the agent should correct or reinforce going forward."""
     )
 
 
-# ---------------------------------------------------------------------------
-# FAIL state management (file-locked, atomic)
-# ---------------------------------------------------------------------------
-
-
-def _state_path(session_id: str) -> Path:
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)
-    return STATE_DIR / f"codex-reflector-fails-{safe}.json"
-
-
-def _atomic_update_state(
-    session_id: str,
-    updater: Callable[[list[dict]], list[dict] | None],
-) -> list[dict]:
-    """Atomically read-modify-write state under exclusive lock.
-    updater receives current entries, returns new entries or None (no change).
-    """
-    if not session_id:
-        return []
-    path = _state_path(session_id)
-    if not path.exists():
-        path.touch(mode=0o600)
-    with open(path, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.seek(0)
-            try:
-                entries = json.load(f)
-            except (json.JSONDecodeError, ValueError):
-                entries = []
-            new_entries = updater(entries)
-            if new_entries is not None:
-                f.seek(0)
-                f.truncate()
-                json.dump(new_entries, f)
-                return new_entries
-            return entries
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-
-def _read_state(session_id: str) -> list[dict]:
-    """Read state (read-only, shared lock)."""
-    if not session_id:
-        return []
-    path = _state_path(session_id)
-    if not path.exists():
-        return []
-    try:
-        with open(path, "r") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            try:
-                return json.load(f)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def write_fail_state(
-    session_id: str, tool_name: str, file_path: str, feedback: str
-) -> None:
-    def updater(entries: list[dict]) -> list[dict]:
-        filtered = [e for e in entries if e.get("file_path") != file_path]
-        filtered.append(
-            {
-                "tool_name": tool_name,
-                "file_path": file_path,
-                "feedback": feedback[:1500],
-            }
-        )
-        return filtered
-
-    _atomic_update_state(session_id, updater)
-
-
-def clear_fail_state(session_id: str, file_path: str) -> None:
-    def updater(entries: list[dict]) -> list[dict] | None:
-        filtered = [e for e in entries if e.get("file_path") != file_path]
-        return filtered if len(filtered) != len(entries) else None
-
-    _atomic_update_state(session_id, updater)
-
-
-def format_fails(entries: list[dict]) -> str:
-    lines = []
-    for e in entries[:5]:  # cap at 5
-        lines.append(f"- {e.get('file_path', '?')}: {e.get('feedback', '')[:300]}")
-    return "\n".join(lines)
-
-
 # Verdict → display prefix (shared by code review + plan review)
 _VERDICT_PREFIX: dict[str, str] = {
     "FAIL": "\u26a0\ufe0f FAIL",
@@ -1161,7 +1067,6 @@ def _compact_output(text: str, cwd: str) -> str:
 
 
 def respond_code_review(
-    session_id: str,
     tool_name: str,
     tool_input: dict,
     raw_output: str,
@@ -1171,12 +1076,6 @@ def respond_code_review(
     verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
     file_path = tool_input.get("file_path", tool_input.get("path", "unknown"))
-
-    if verdict == "FAIL":
-        write_fail_state(session_id, tool_name, file_path, raw_output)
-    elif verdict == "PASS":
-        clear_fail_state(session_id, file_path)
-    # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"Codex Reflector {prefix} [{file_path}]:\n{raw_output}"
@@ -1217,7 +1116,6 @@ def respond_bash_failure(
 
 
 def respond_plan_review(
-    session_id: str,
     plan_path: str,
     raw_output: str,
     cwd: str = "",
@@ -1225,12 +1123,6 @@ def respond_plan_review(
 ) -> dict:
     verdict = parse_verdict(raw_output) if raw_output else "UNCERTAIN"
     raw_output = _compact_output(raw_output, cwd) if raw_output else raw_output
-
-    if verdict == "FAIL":
-        write_fail_state(session_id, "ExitPlanMode", plan_path, raw_output)
-    elif verdict == "PASS":
-        clear_fail_state(session_id, plan_path)
-    # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"Codex Plan Review {prefix} [{plan_path}]:\n{raw_output}"
@@ -1244,7 +1136,6 @@ def respond_plan_review(
 
 
 def respond_subagent_review(
-    session_id: str,
     agent_type: str,
     raw_output: str,
     cwd: str = "",
@@ -1254,12 +1145,6 @@ def respond_subagent_review(
         return {}
     verdict = parse_verdict(raw_output)
     raw_output = _compact_output(raw_output, cwd)
-
-    if verdict == "FAIL":
-        write_fail_state(session_id, "SubagentStop", agent_type, raw_output)
-    elif verdict == "PASS":
-        clear_fail_state(session_id, agent_type)
-    # UNCERTAIN: no state change (preserves prior FAIL if any)
 
     prefix = _VERDICT_PREFIX[verdict]
     msg = f"Codex Subagent Review {prefix}:\n{raw_output}"
@@ -1274,16 +1159,7 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
         debug("stop_hook_active=true, approving stop")
         return None
 
-    session_id = hook_data.get("session_id", "")
-
-    # 2. Fast path: pending FAIL states (no codex needed)
-    fails = _read_state(session_id)
-    if fails:
-        reason = f"Unresolved Codex FAIL reviews:\n{format_fails(fails)}"
-        debug(f"blocking stop: {len(fails)} fails")
-        return {"decision": "block", "reason": reason, "_exit": 2}
-
-    # 3. Prefer last_assistant_message; fall back to transcript tail
+    # 2. Prefer last_assistant_message; fall back to transcript tail
     last_msg = hook_data.get("last_assistant_message", "")
     if last_msg:
         transcript = last_msg
@@ -1295,7 +1171,7 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
         debug("no transcript available, approving stop")
         return None  # fail-open
 
-    # 4. Invoke codex for work review
+    # 3. Invoke codex for work review
     prompt = build_stop_review_prompt(transcript, cwd=cwd)
     raw_output = invoke_codex(prompt, cwd, effort, model)
 
@@ -1303,7 +1179,7 @@ def respond_stop(hook_data: dict, cwd: str, effort: str, model: str) -> dict | N
         debug("codex returned empty, approving stop (fail-open)")
         return None
 
-    # 5. Parse verdict from raw output, then compact for display
+    # 4. Parse verdict from raw output, then compact for display
     verdict = parse_verdict(raw_output)
     raw_output = _compact_output(raw_output, cwd)
     if verdict == "FAIL":
@@ -1633,6 +1509,26 @@ def run_self_test() -> None:
         if ok:
             all_passed += 1
 
+    # --- Stateless stop tests ---
+    print("\n=== Stateless Stop ===")
+    import glob
+
+    pat = "/tmp/codex-reflector-fails-*.json"
+    before = set(glob.glob(pat))
+    r_active = respond_stop({"stop_hook_active": True}, "", "low", DEFAULT_MODEL)
+    r_empty = respond_stop({"stop_hook_active": False}, "", "low", DEFAULT_MODEL)
+    no_new_cache = set(glob.glob(pat)) == before
+    for desc, ok in [
+        ("loop guard returns None", r_active is None),
+        ("empty transcript returns None", r_empty is None),
+        ("writes no cache file", no_new_cache),
+    ]:
+        status = "PASS" if ok else "FAIL"
+        print(f"  {status}: {desc}")
+        all_total += 1
+        if ok:
+            all_passed += 1
+
     print(f"\n{all_passed}/{all_total} passed")
     sys.exit(0 if all_passed == all_total else 1)
 
@@ -1661,7 +1557,6 @@ def main() -> None:
 
     event = hook_data.get("hook_event_name", "")
     cwd = hook_data.get("cwd", os.getcwd())
-    session_id = hook_data.get("session_id", "")
 
     debug(f"event={event} tool={hook_data.get('tool_name', 'N/A')}")
 
@@ -1682,7 +1577,7 @@ def main() -> None:
     #         sys.exit(0)
     #     prompt = build_subagent_review_prompt(agent_type, transcript_tail, cwd=cwd)
     #     raw = invoke_codex(prompt, cwd, _ME_SUBAGENT_REVIEW.effort, _ME_SUBAGENT_REVIEW.model)
-    #     result = respond_subagent_review(session_id, agent_type, raw, cwd=cwd)
+    #     result = respond_subagent_review(agent_type, raw, cwd=cwd)
 
     elif event == "PreCompact":
         result = respond_precompact(
@@ -1711,7 +1606,7 @@ def main() -> None:
             )
             raw = invoke_codex(prompt, cwd, effort, model)
             result = respond_code_review(
-                session_id, tool_name, tool_input, raw, cwd=cwd, event_name=event
+                tool_name, tool_input, raw, cwd=cwd, event_name=event
             )
         elif category == "plan_review":
             plan = _find_plan_for_session(hook_data)
@@ -1721,7 +1616,7 @@ def main() -> None:
             prompt = build_plan_review_prompt(plan_content, plan_path, cwd=cwd)
             raw = invoke_codex(prompt, cwd, effort, model)
             result = respond_plan_review(
-                session_id, plan_path, raw, cwd=cwd, event_name=event
+                plan_path, raw, cwd=cwd, event_name=event
             )
         elif category == "thinking":
             prompt = build_thinking_prompt(tool_name, tool_input, cwd=cwd)

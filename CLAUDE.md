@@ -5,9 +5,9 @@ This file is only for repo-specific constraints that are easy to break and expen
 ## Surface split
 
 - **Rule:** Treat the repository as two hook surfaces, not one implementation. The Claude/Cursor plugin is `scripts/codex-reflector.py` wired by `hooks/hooks.json`; the oh-my-pi port is `omp/codex-reflector.ts` loaded through `package.json` `omp.extensions`.
-  **Why:** Both surfaces call `codex exec` and expose the same reflector idea, but their hook delivery, state persistence, and stop-enforcement mechanisms differ. Editing the wrong surface fixes nothing.
+  **Why:** Both surfaces call `codex exec` and expose the same reflector idea, but their hook delivery and stop-enforcement mechanisms differ. Editing the wrong surface fixes nothing.
 
-- **Rule:** For shared behavior changes, check both surfaces before declaring parity: verdict parsing, prompt builders, redaction/sandboxing, fail-state semantics, model/effort gating, and changed-file target resolution.
+- **Rule:** For shared behavior changes, check both surfaces before declaring parity: verdict parsing, prompt builders, redaction/sandboxing, stop-review enforcement, model/effort gating, and changed-file target resolution.
   **Why:** The TypeScript file is a native port of the Python hook, while the OMP tests codify port-specific contracts. Silent drift produces different review outcomes for Claude/Cursor vs OMP users.
 
 ## Python Claude/Cursor plugin invariants
@@ -24,8 +24,8 @@ This file is only for repo-specific constraints that are easy to break and expen
 - **Rule:** Parse verdicts from raw Codex output before any compaction in every responder that branches on PASS/FAIL/UNCERTAIN.
   **Why:** Compaction can remove or rewrite the verdict line. A buried or stripped verdict becomes UNCERTAIN and changes fail-open/fail-closed behavior.
 
-- **Rule:** Python FAIL state is per session and per target file, guarded by `fcntl.flock`. FAIL records state, PASS clears it, and UNCERTAIN must not mutate it. Stop first blocks on unresolved recorded FAILs; a Stop-review UNCERTAIN is fail-closed and blocks.
-  **Why:** Individual reviews are advisory, but Stop is the accumulation checkpoint. Clearing state on UNCERTAIN hides unresolved FAILs from that checkpoint.
+- **Rule:** The Python plugin is stateless — no `.json` FAIL cache and no `fcntl` state file. `respond_code_review`/`respond_plan_review` inject the verdict + opinion inline as `systemMessage` (every verdict), adding `hookSpecificOutput.additionalContext` for FAIL/UNCERTAIN. `respond_stop` is a fresh holistic review run once per stop chain: fail-closed on the first stop (FAIL/UNCERTAIN return `decision: "block"`/`_exit: 2`), then the retained `stop_hook_active` guard settles a re-stop.
+  **Why:** Per-tool reviews self-correct inline; the holistic Stop review is the gate. Python has no continuation cap, so `stop_hook_active` is the only safe loop bound — re-reviewing every stop without it could never settle.
 
 - **Rule:** Keep Cursor payload adaptation contained in `_normalize_cursor_input()` and generated settings from `scripts/install-cursor.sh`.
   **Why:** Cursor compatibility maps event names and fields into Claude-shaped hook data. Scattering Cursor field handling through responders makes every future hook change harder to audit.
@@ -38,10 +38,10 @@ This file is only for repo-specific constraints that are easy to break and expen
 - **Rule:** On successful `tool_result` reviews, return a `content` override. On tool error paths, send diagnostics with `pi.sendMessage()` and return `undefined`.
   **Why:** OMP rethrows tool errors. Overriding error results would corrupt the harness error path instead of preserving the original failure.
 
-- **Rule:** OMP FAIL state lives in `FailTracker` and is replayed from `codex-reflector-fail` custom entries. Open per-file generation tokens before awaiting Codex; drop a combined review if any target path has gone stale; dedupe multi-file `ast_edit` paths.
-  **Why:** Reviews race with later edits. Per-path generations prevent old Codex output from overwriting newer state, and deduping avoids self-superseding a single edit.
+- **Rule:** The OMP extension is stateless — no `FailTracker`, no `appendEntry` FAIL entries, no `session_start` replay. `tool_result` code reviews inject their verdict + opinion inline via `codeReviewResponse` for every verdict (PASS included).
+  **Why:** Per-file reviews self-correct inline; the cross-event FAIL cache was removed by design, leaving the holistic Stop review as the gate.
 
-- **Rule:** Enforce unresolved FAILs and Stop-review FAIL/UNCERTAIN through the native `session_stop` event (main-session-only, awaited before settle), returning `{ continue: true, additionalContext }`. Rely on oh-my-pi's built-in 8-continuation cap — do not reimplement a port-side loop counter. Re-run the holistic Stop review on every settle attempt (no `stop_hook_active` guard); a one-shot review would let a FAIL/UNCERTAIN settle on the next stop.
+- **Rule:** The OMP Stop gate is a fresh holistic review on the native `session_stop` event (main-session-only, awaited before settle): PASS lets the turn settle; FAIL/UNCERTAIN is fail-closed and returns `{ continue: true, additionalContext }`. Re-run it on every settle attempt (no `stop_hook_active` guard, no cache fast-path, no per-file dedup), and rely on oh-my-pi's built-in 8-continuation cap — do not reimplement a port-side loop counter. A one-shot review would let a FAIL/UNCERTAIN settle on the next stop.
   **Why:** `session_stop` (omp 16.0.5, #2834) is the main-agent Stop analog; `agent_end` also fires for subagent sessions and its return value is ignored. The harness owns loop protection, so a port-side cap is redundant drift.
 
 - **Rule:** Pre-compaction reflection is advisory only.

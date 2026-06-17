@@ -52,7 +52,7 @@ Place this plugin at `~/.claude/codex-reflector/` and restart Claude Code.
 | PostToolUse | Write, Edit, morph-edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
 | PostToolUse | sequential-thinking, actor-critic, shannon | sync | Metacognitive reflection (advisory, no verdict) |
 | PostToolUseFailure | Bash | async | Root cause diagnosis for failed commands |
-| Stop | Agent finishing | sync | Blocks if unresolved FAIL reviews exist |
+| Stop | Agent finishing | sync | Fresh holistic review; blocks on FAIL/UNCERTAIN |
 | PreCompact | Context compaction | sync | Summarizes critical session context |
 
 ### Use with Cursor
@@ -98,7 +98,7 @@ Cursor compatibility notes:
 
 - `PostToolUse`, `Stop`, and `PreCompact` run through Cursor's Claude hook compatibility.
 - `PostToolUseFailure` is included in the export for Claude parity, but Cursor does not currently list it in its Claude hook mapping table.
-- Cursor treats Claude `Stop` blocks as follow-up messages, so unresolved FAIL reviews cause the agent to continue with Codex feedback instead of hard-stopping the UI.
+- Cursor treats Claude `Stop` blocks as follow-up messages, so a FAIL or UNCERTAIN Stop review causes the agent to continue with Codex feedback instead of hard-stopping the UI.
 - The direct export mirrors the Claude plugin matcher. Cursor only fires the parts whose tool names are exposed through its Claude hook compatibility layer.
 
 ---
@@ -116,11 +116,11 @@ curl -fsSL https://omp.sh/install | sh       # macOS / Linux
 bun install -g @oh-my-pi/pi-coding-agent      # any platform, bun >= 1.3.14
 ```
 
-The module is a hook factory (registers via `pi.on`), so it loads through **either** omp surface — pick one.
+The module is an oh-my-pi **extension** — a default-export factory that registers handlers via `pi.on`. Its Stop gate uses the `session_stop` event, which the extension surface guarantees, so [installing it as an extension](#install-as-an-extension) is the canonical path.
 
 ### Install as a hook
 
-oh-my-pi auto-discovers hooks in `.omp/hooks/` (project) and `~/.omp/hooks/` (user). Symlink the module into one of those, or load it for a single run:
+oh-my-pi auto-discovers hooks in `.omp/hooks/` (project) and `~/.omp/hooks/` (user). The tool-review and pre-compaction handlers run here, but the `session_stop` Stop gate needs the extension surface — prefer [Install as an extension](#install-as-an-extension) for full enforcement. Symlink the module into one of those, or load it for a single run:
 
 ```sh
 mkdir -p ~/.omp/hooks
@@ -158,7 +158,7 @@ Register the module through the extension surface — pick one:
 
 Reads the same [environment variables](#environment-variables) as the Claude plugin. Run the unit tests with `bun test omp/codex-reflector.test.ts`.
 
-**Behavioral delta from the Claude plugin:** oh-my-pi enforces unresolved FAIL reviews through the native `session_stop` event (main-session-only, awaited before the turn settles); when FAILs remain — or the holistic Stop review returns FAIL/UNCERTAIN — the hook returns `{ continue: true, additionalContext }` so the agent keeps working with that context, and the holistic Stop review re-runs on each settle attempt until it passes, all bounded by oh-my-pi's built-in 8-continuation cap.
+**Behavioral delta from the Claude plugin:** both ports are stateless. Code reviews inject their verdict and full opinion inline for every verdict; the Stop gate is a fresh holistic review on the native `session_stop` event (main-session-only, awaited before the turn settles). It is fail-closed on every stop — PASS settles, FAIL/UNCERTAIN returns `{ continue: true, additionalContext }` so the agent keeps working with that context — and re-runs on each settle attempt, bounded by oh-my-pi's built-in 8-continuation cap.
 
 ### Hook events
 
@@ -167,9 +167,8 @@ Reads the same [environment variables](#environment-variables) as the Claude plu
 | `tool_result` | `write` / `edit` / `ast_edit`, Fast-Apply MCP edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
 | `tool_result` | `sequential` / `shannon` thinking-MCP steps | sync | Metacognitive reflection (advisory, no verdict) |
 | `tool_result` (`isError`) | failed `bash`, failed Fast-Apply edit | async | Root-cause diagnosis for failed calls |
-| `session_stop` | main agent about to settle | sync | Continues the agent while unresolved FAILs / a failing Stop review remain; native 8-continuation cap |
+| `session_stop` | main agent about to settle | sync | Fresh holistic Stop review every stop; PASS settles, FAIL/UNCERTAIN continues; native 8-continuation cap |
 | `session_before_compact` | context compaction | sync | Summarizes critical session context |
-| `session_start` | session start | — | Rebuilds FAIL state from prior session entries |
 
 ---
 
@@ -185,13 +184,13 @@ Both surfaces honor the same variables.
 
 ## How It Works
 
-Both surfaces run the same Codex reflection loop. The implementation specifics below (state file, Stop hook, `--test-parse`) describe the Python plugin; the omp port mirrors the same behavior with the [delta noted above](#behavior).
+Both surfaces run the same Codex reflection loop and keep no FAIL state — reviews inject their verdict and opinion inline, and the Stop hook runs a fresh holistic review rather than consulting persisted state. The implementation specifics below (`--test-parse`, exit-code blocking) describe the Python plugin; the omp port mirrors the behavior with the [delta noted above](#behavior).
 
 ### Code Reviews (async)
 
-After Write/Edit tool calls, Codex reviews the change in a read-only sandbox. The verdict (PASS/FAIL/UNCERTAIN) and full opinion are delivered as a `systemMessage` on the next conversation turn. Codex's opinions are always returned regardless of verdict.
+After Write/Edit tool calls, Codex reviews the change in a read-only sandbox. The verdict (PASS/FAIL/UNCERTAIN) and full opinion are injected inline so the agent sees them on the next turn — returned for every verdict, not just failures. FAIL/UNCERTAIN additionally feed the verdict back as agent context for self-correction.
 
-FAIL verdicts are tracked in a state file. The Stop hook prevents Claude from finishing until all FAILs are resolved.
+The reflector keeps no FAIL state. Instead the Stop hook runs a fresh holistic review of the session: in the Python plugin once per stop chain — fail-closed on the first stop (FAIL/UNCERTAIN block via exit `2`), then the `stop_hook_active` guard lets a re-stop settle; in omp on every stop, fail-closed each time (PASS settles, FAIL/UNCERTAIN continues), bounded by the native 8-continuation cap.
 
 ### Thinking Reflection (sync)
 
@@ -213,7 +212,7 @@ The parser extracts PASS/FAIL from Codex's output:
 - Checks first 5 non-empty lines for verdict words
 - Supports keyed formats (`Verdict: PASS`, `result=FAIL`)
 - Contradictory signals (both PASS and FAIL) resolve to UNCERTAIN
-- **Fail-open**: UNCERTAIN never blocks
+- **Fail-open (advisory paths)**: an UNCERTAIN code review or diagnostic never blocks; the Stop gate is the exception — it treats UNCERTAIN as fail-closed (blocks in the plugin, continues in omp)
 
 Self-test the parser with `python3 scripts/codex-reflector.py --test-parse` (plugin) or `bun test omp/codex-reflector.test.ts` (omp port).
 
@@ -222,7 +221,6 @@ Self-test the parser with `python3 scripts/codex-reflector.py --test-parse` (plu
 - **Fail-open**: any internal error approves silently and never blocks the agent — the Python plugin exits `0`; the omp hook returns without a block.
 - **Read-only sandbox**: Codex runs with `--sandbox read-only` — it cannot modify files (both surfaces).
 - **Loop prevention**: the plugin's Stop hook checks the `stop_hook_active` flag; the omp port relies on the native `session_stop` event and oh-my-pi's built-in 8-continuation cap.
-- **Concurrent state**: the plugin guards its state file with `fcntl.flock`; the omp port persists FAILs as session custom entries through the harness.
 
 ## License
 

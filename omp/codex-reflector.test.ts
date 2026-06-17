@@ -1,21 +1,19 @@
 import { describe, expect, test } from "bun:test";
 
-import type { HookAPI, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
+import type { ExtensionAPI, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 
 import codexReflector, {
 	changeSizeHeuristics,
 	classify,
-	type FailEntry,
-	FailTracker,
+	codeReviewResponse,
 	fileHeuristics,
-	formatFails,
 	gateModelEffort,
+	notifyUI,
 	parseVerdict,
 	redact,
 	renderTranscript,
 	resolveChangeTarget,
 	sandboxContent,
-	stopContinuationForFails,
 } from "./codex-reflector.ts";
 
 describe("parseVerdict", () => {
@@ -153,32 +151,6 @@ describe("gateModelEffort", () => {
 	});
 });
 
-describe("formatFails", () => {
-	test("renders `- tool [file]: feedback` lines", () => {
-		const fails = new Map<string, FailEntry>([
-			["a.ts", { tool: "write", file: "a.ts", feedback: "missing guard" }],
-			["b.ts", { tool: "edit", file: "b.ts", feedback: "bad name" }],
-		]);
-		expect(formatFails(fails)).toBe("- write [a.ts]: missing guard\n- edit [b.ts]: bad name");
-	});
-	test("empty map -> empty string", () => {
-		expect(formatFails(new Map())).toBe("");
-	});
-	test("caps at 5 entries", () => {
-		const fails = new Map<string, FailEntry>();
-		for (let i = 0; i < 8; i++) {
-			fails.set(`f${i}.ts`, { tool: "write", file: `f${i}.ts`, feedback: "x" });
-		}
-		expect(formatFails(fails).split("\n")).toHaveLength(5);
-	});
-	test("truncates feedback to 300 chars", () => {
-		const fails = new Map<string, FailEntry>([
-			["a.ts", { tool: "write", file: "a.ts", feedback: "y".repeat(500) }],
-		]);
-		expect(formatFails(fails)).toBe(`- write [a.ts]: ${"y".repeat(300)}`);
-	});
-});
-
 describe("sandboxContent", () => {
 	test("wraps content in untrusted-data tags with label", () => {
 		const out = sandboxContent("code-change", "payload");
@@ -191,7 +163,7 @@ describe("sandboxContent", () => {
 
 describe("factory", () => {
 	function makePi(): {
-		pi: HookAPI;
+		pi: ExtensionAPI;
 		events: string[];
 		handlers: Map<string, (event: unknown, ctx: unknown) => unknown>;
 	} {
@@ -205,17 +177,16 @@ describe("factory", () => {
 				}
 			},
 			sendMessage: () => {},
-			appendEntry: () => {},
 			logger: { debug() {}, info() {} },
 		};
-		return { pi: stub as unknown as HookAPI, events, handlers };
+		return { pi: stub as unknown as ExtensionAPI, events, handlers };
 	}
 
-	test("registers the four lifecycle handlers", () => {
+	test("registers the three lifecycle handlers", () => {
 		const { pi, events } = makePi();
 		codexReflector(pi);
 		expect(new Set(events)).toEqual(
-			new Set(["session_start", "tool_result", "session_stop", "session_before_compact"]),
+			new Set(["tool_result", "session_stop", "session_before_compact"]),
 		);
 	});
 
@@ -239,54 +210,9 @@ describe("factory", () => {
 		expect(handler).toBeDefined();
 		const result = await handler?.(
 			{ type: "session_stop", messages: [], turn_id: 1, session_id: "s", stop_hook_active: false },
-			{ cwd: ".", ui: { notify() {} }, sessionManager: { getEntries: () => [] } },
+			{ cwd: ".", ui: { notify() {} } },
 		);
 		expect(result).toBeUndefined();
-	});
-});
-
-describe("stopContinuationForFails", () => {
-	test("empty map allows settling (undefined)", () => {
-		expect(stopContinuationForFails(new Map())).toBeUndefined();
-	});
-	test("unresolved FAILs request continuation carrying the fail list", () => {
-		const fails = new Map<string, FailEntry>([
-			["a.ts", { tool: "edit", file: "a.ts", feedback: "missing null check" }],
-		]);
-		const r = stopContinuationForFails(fails);
-		expect(r?.continue).toBe(true);
-		expect(r?.additionalContext).toContain("a.ts");
-		expect(r?.additionalContext).toContain("missing null check");
-	});
-});
-
-describe("FailTracker", () => {
-	test("record then clear toggles membership", () => {
-		const t = new FailTracker();
-		t.record("a.ts", "edit", "bad");
-		expect(t.size).toBe(1);
-		expect(t.clear("a.ts")).toBe(true);
-		expect(t.size).toBe(0);
-		expect(t.clear("a.ts")).toBe(false);
-	});
-
-	test("generation guard marks a superseded review stale (BE3)", () => {
-		const t = new FailTracker();
-		const gen1 = t.begin("a.ts");
-		const gen2 = t.begin("a.ts"); // newer review opens before the first finishes
-		expect(t.isCurrent("a.ts", gen1)).toBe(false);
-		expect(t.isCurrent("a.ts", gen2)).toBe(true);
-	});
-
-	test("replay rebuilds from a fresh map, dropping stale prior state (BE5)", () => {
-		const t = new FailTracker();
-		t.record("stale.ts", "edit", "leftover");
-		t.replay([
-			{ op: "set", file: "a.ts", tool: "write", feedback: "bad" },
-			{ op: "set", file: "b.ts", tool: "edit", feedback: "worse" },
-			{ op: "clear", file: "a.ts" },
-		]);
-		expect([...t.entries().keys()]).toEqual(["b.ts"]);
 	});
 });
 
@@ -360,5 +286,42 @@ describe("resolveChangeTarget", () => {
 	test("ast_edit dedups repeated paths (avoids self-superseding generations)", () => {
 		const r = resolveChangeTarget(evt("ast_edit", { paths: ["a.ts", "a.ts", "b.ts"] }));
 		expect(r.filePaths).toEqual(["a.ts", "b.ts"]);
+	});
+});
+
+describe("notifyUI", () => {
+	test("never throws and respects hasUI", () => {
+		const throwing = {
+			hasUI: true,
+			ui: {
+				notify() {
+					throw new Error("no UI");
+				},
+			},
+		};
+		expect(() => notifyUI(throwing, "x", "info")).not.toThrow();
+		let called = false;
+		const headless = {
+			hasUI: false,
+			ui: {
+				notify() {
+					called = true;
+				},
+			},
+		};
+		notifyUI(headless, "x", "info");
+		expect(called).toBe(false);
+	});
+});
+
+describe("codeReviewResponse", () => {
+	test("returns the opinion text for PASS", () => {
+		const last = codeReviewResponse("PASS", "a.ts", "looks correct", []).content?.at(-1) as {
+			type: string;
+			text: string;
+		};
+		expect(last.type).toBe("text");
+		expect(last.text).toContain("PASS");
+		expect(last.text).toContain("looks correct");
 	});
 });
