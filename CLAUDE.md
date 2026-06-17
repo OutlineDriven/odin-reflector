@@ -41,8 +41,8 @@ This file is only for repo-specific constraints that are easy to break and expen
 - **Rule:** OMP FAIL state lives in `FailTracker` and is replayed from `codex-reflector-fail` custom entries. Open per-file generation tokens before awaiting Codex; drop a combined review if any target path has gone stale; dedupe multi-file `ast_edit` paths.
   **Why:** Reviews race with later edits. Per-path generations prevent old Codex output from overwriting newer state, and deduping avoids self-superseding a single edit.
 
-- **Rule:** Do not port Python's exit-2 Stop veto into OMP. OMP enforces unresolved FAILs and Stop-review FAIL/UNCERTAIN through bounded `agent_end` follow-up messages (`REENGAGE_CAP`).
-  **Why:** OMP has no Claude Stop stderr veto path; re-engagement is the enforcement channel, and the cap prevents infinite loops.
+- **Rule:** Enforce unresolved FAILs and Stop-review FAIL/UNCERTAIN through the native `session_stop` event (main-session-only, awaited before settle), returning `{ continue: true, additionalContext }`. Rely on oh-my-pi's built-in 8-continuation cap — do not reimplement a port-side loop counter. Re-run the holistic Stop review on every settle attempt (no `stop_hook_active` guard); a one-shot review would let a FAIL/UNCERTAIN settle on the next stop.
+  **Why:** `session_stop` (omp 16.0.5, #2834) is the main-agent Stop analog; `agent_end` also fires for subagent sessions and its return value is ignored. The harness owns loop protection, so a port-side cap is redundant drift.
 
 - **Rule:** Pre-compaction reflection is advisory only.
   **Why:** The hook should surface metacognition before compaction without mutating the compaction operation or session state.

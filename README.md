@@ -158,7 +158,7 @@ Register the module through the extension surface — pick one:
 
 Reads the same [environment variables](#environment-variables) as the Claude plugin. Run the unit tests with `bun test omp/codex-reflector.test.ts`.
 
-**Behavioral delta from the Claude plugin:** oh-my-pi has no hard Stop-veto, so unresolved FAIL reviews are enforced by **re-engaging the agent** on `agent_end` — a follow-up turn carrying the FAIL list — bounded to 3 re-engagements (the guard resets when a FAIL is cleared or a stop review passes). After the cap, the FAILs are surfaced for manual resolution instead of looping forever.
+**Behavioral delta from the Claude plugin:** oh-my-pi enforces unresolved FAIL reviews through the native `session_stop` event (main-session-only, awaited before the turn settles); when FAILs remain — or the holistic Stop review returns FAIL/UNCERTAIN — the hook returns `{ continue: true, additionalContext }` so the agent keeps working with that context, and the holistic Stop review re-runs on each settle attempt until it passes, all bounded by oh-my-pi's built-in 8-continuation cap.
 
 ### Hook events
 
@@ -167,7 +167,7 @@ Reads the same [environment variables](#environment-variables) as the Claude plu
 | `tool_result` | `write` / `edit` / `ast_edit`, Fast-Apply MCP edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
 | `tool_result` | `sequential` / `shannon` thinking-MCP steps | sync | Metacognitive reflection (advisory, no verdict) |
 | `tool_result` (`isError`) | failed `bash`, failed Fast-Apply edit | async | Root-cause diagnosis for failed calls |
-| `agent_end` | turn / loop end | sync | Re-engages the agent while unresolved FAILs remain (Stop-hook equivalent) |
+| `session_stop` | main agent about to settle | sync | Continues the agent while unresolved FAILs / a failing Stop review remain; native 8-continuation cap |
 | `session_before_compact` | context compaction | sync | Summarizes critical session context |
 | `session_start` | session start | — | Rebuilds FAIL state from prior session entries |
 
@@ -221,7 +221,7 @@ Self-test the parser with `python3 scripts/codex-reflector.py --test-parse` (plu
 
 - **Fail-open**: any internal error approves silently and never blocks the agent — the Python plugin exits `0`; the omp hook returns without a block.
 - **Read-only sandbox**: Codex runs with `--sandbox read-only` — it cannot modify files (both surfaces).
-- **Loop prevention**: the plugin's Stop hook checks the `stop_hook_active` flag; the omp port bounds re-engagement to 3 follow-ups.
+- **Loop prevention**: the plugin's Stop hook checks the `stop_hook_active` flag; the omp port relies on the native `session_stop` event and oh-my-pi's built-in 8-continuation cap.
 - **Concurrent state**: the plugin guards its state file with `fcntl.flock`; the omp port persists FAILs as session custom entries through the harness.
 
 ## License

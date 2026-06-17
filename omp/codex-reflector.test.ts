@@ -15,6 +15,7 @@ import codexReflector, {
 	renderTranscript,
 	resolveChangeTarget,
 	sandboxContent,
+	stopContinuationForFails,
 } from "./codex-reflector.ts";
 
 describe("parseVerdict", () => {
@@ -189,25 +190,32 @@ describe("sandboxContent", () => {
 });
 
 describe("factory", () => {
-	function makePi(): { pi: HookAPI; events: string[] } {
+	function makePi(): {
+		pi: HookAPI;
+		events: string[];
+		handlers: Map<string, (event: unknown, ctx: unknown) => unknown>;
+	} {
 		const events: string[] = [];
+		const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 		const stub = {
-			on: (name: string) => {
+			on: (name: string, handler: unknown) => {
 				events.push(name);
+				if (typeof handler === "function") {
+					handlers.set(name, handler as (event: unknown, ctx: unknown) => unknown);
+				}
 			},
 			sendMessage: () => {},
 			appendEntry: () => {},
 			logger: { debug() {}, info() {} },
 		};
-		// Test boundary: the stub only needs the surface the factory touches at registration.
-		return { pi: stub as unknown as HookAPI, events };
+		return { pi: stub as unknown as HookAPI, events, handlers };
 	}
 
 	test("registers the four lifecycle handlers", () => {
 		const { pi, events } = makePi();
 		codexReflector(pi);
 		expect(new Set(events)).toEqual(
-			new Set(["session_start", "tool_result", "agent_end", "session_before_compact"]),
+			new Set(["session_start", "tool_result", "session_stop", "session_before_compact"]),
 		);
 	});
 
@@ -223,6 +231,33 @@ describe("factory", () => {
 			else process.env.CODEX_REFLECTOR_ENABLED = prev;
 		}
 	});
+
+	test("session_stop settles (undefined) when there is nothing to review", async () => {
+		const { pi, handlers } = makePi();
+		codexReflector(pi);
+		const handler = handlers.get("session_stop");
+		expect(handler).toBeDefined();
+		const result = await handler?.(
+			{ type: "session_stop", messages: [], turn_id: 1, session_id: "s", stop_hook_active: false },
+			{ cwd: ".", ui: { notify() {} }, sessionManager: { getEntries: () => [] } },
+		);
+		expect(result).toBeUndefined();
+	});
+});
+
+describe("stopContinuationForFails", () => {
+	test("empty map allows settling (undefined)", () => {
+		expect(stopContinuationForFails(new Map())).toBeUndefined();
+	});
+	test("unresolved FAILs request continuation carrying the fail list", () => {
+		const fails = new Map<string, FailEntry>([
+			["a.ts", { tool: "edit", file: "a.ts", feedback: "missing null check" }],
+		]);
+		const r = stopContinuationForFails(fails);
+		expect(r?.continue).toBe(true);
+		expect(r?.additionalContext).toContain("a.ts");
+		expect(r?.additionalContext).toContain("missing null check");
+	});
 });
 
 describe("FailTracker", () => {
@@ -235,42 +270,12 @@ describe("FailTracker", () => {
 		expect(t.clear("a.ts")).toBe(false);
 	});
 
-	test("a no-op clear does NOT reset the re-engage guard (BE1)", () => {
-		const t = new FailTracker();
-		expect(t.tryReengage(3)).toBe(true); // 1
-		expect(t.tryReengage(3)).toBe(true); // 2
-		expect(t.clear("never.ts")).toBe(false); // file absent -> no reset
-		expect(t.tryReengage(3)).toBe(true); // 3 -> cap
-		expect(t.tryReengage(3)).toBe(false); // still capped; guard was not re-armed
-	});
-
-	test("clearing the last tracked FAIL resets the guard (observable progress)", () => {
-		const t = new FailTracker();
-		t.record("a.ts", "edit", "bad");
-		expect(t.tryReengage(3)).toBe(true);
-		expect(t.tryReengage(3)).toBe(true);
-		expect(t.clear("a.ts")).toBe(true); // last FAIL gone -> reset
-		expect(t.tryReengage(3)).toBe(true);
-		expect(t.tryReengage(3)).toBe(true);
-		expect(t.tryReengage(3)).toBe(true);
-		expect(t.tryReengage(3)).toBe(false);
-	});
-
 	test("generation guard marks a superseded review stale (BE3)", () => {
 		const t = new FailTracker();
 		const gen1 = t.begin("a.ts");
 		const gen2 = t.begin("a.ts"); // newer review opens before the first finishes
 		expect(t.isCurrent("a.ts", gen1)).toBe(false);
 		expect(t.isCurrent("a.ts", gen2)).toBe(true);
-	});
-
-	test("tryReengage is bounded by cap and resettable", () => {
-		const t = new FailTracker();
-		expect(t.tryReengage(2)).toBe(true);
-		expect(t.tryReengage(2)).toBe(true);
-		expect(t.tryReengage(2)).toBe(false);
-		t.resetReengage();
-		expect(t.tryReengage(2)).toBe(true);
 	});
 
 	test("replay rebuilds from a fresh map, dropping stale prior state (BE5)", () => {

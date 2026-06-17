@@ -12,8 +12,8 @@
  *   - thinking:       sequential / shannon MCP                            -> tool_result content
  *   - bash diagnostic:bash (error)                                        -> sendMessage
  *   - fast-apply diag:Fast-Apply MCP (error, Morph payload)              -> sendMessage
- *   - stop review:    agent_end (no pending FAILs)                        -> sendMessage / re-engage
- *   - FAIL enforce:   agent_end (pending FAILs)                           -> bounded re-engage
+ *   - stop review:    session_stop (no pending FAILs, re-run each settle)   -> continue / sendMessage
+ *   - FAIL enforce:   session_stop (pending FAILs)                        -> continue
  *   - precompaction:  session_before_compact                             -> sendMessage
  *
  * Delivery-channel rule: oh-my-pi applies a tool_result `content` override only
@@ -30,7 +30,12 @@ import { readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { HookAPI, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
+import type { HookAPI, ToolResultEvent, HookContext } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
+
+import type {
+	SessionStopEvent,
+	SessionStopEventResult,
+} from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -44,7 +49,6 @@ const FAST_MODEL = "gpt-5.4-mini"; // 1M context window
 
 const MAX_COMPACT_CHARS = 400_000; // ~100K tokens — trigger matryoshka above this
 const COMPACT_THRESHOLD = 1500; // chars — re-summarize verbose codex output above this
-const REENGAGE_CAP = 3; // bounded re-engagement loop guard (no Stop-veto in oh-my-pi)
 const CODEX_TIMEOUT_MS = 100_000;
 
 type Effort = "low" | "medium" | "high" | "xhigh";
@@ -64,14 +68,13 @@ export interface FailEntry {
 
 /**
  * Session-scoped FAIL state machine. Pure (no I/O) so it can be unit-tested; the
- * factory wraps it with appendEntry persistence. Tracks per-file FAIL reviews, a
- * bounded re-engage guard, and a per-file review generation so an out-of-order
- * async review cannot apply a stale verdict over a newer one.
+ * factory wraps it with appendEntry persistence. Tracks per-file FAIL reviews
+ * and a per-file review generation so an out-of-order async review cannot apply
+ * a stale verdict over a newer one.
  */
 export class FailTracker {
 	private readonly fails = new Map<string, FailEntry>();
 	private readonly generation = new Map<string, number>();
-	private reengage = 0;
 
 	get size(): number {
 		return this.fails.size;
@@ -97,34 +100,15 @@ export class FailTracker {
 		this.fails.set(file, { tool, file, feedback: feedback.slice(0, 1500) });
 	}
 
-	/**
-	 * Remove a tracked FAIL. Returns whether one existed. Resets the re-engage
-	 * guard ONLY when the last tracked FAIL is actually cleared — a no-op clear
-	 * (file absent) must not re-arm the bounded loop.
-	 */
+	/** Remove a tracked FAIL. Returns whether one existed. */
 	clear(file: string): boolean {
-		const deleted = this.fails.delete(file);
-		if (deleted && this.fails.size === 0) this.reengage = 0;
-		return deleted;
-	}
-
-	/** Reset the re-engage guard (e.g. on a holistic stop-review PASS). */
-	resetReengage(): void {
-		this.reengage = 0;
-	}
-
-	/** Consume one re-engage budget unit; returns false once `cap` is reached. */
-	tryReengage(cap: number): boolean {
-		if (this.reengage >= cap) return false;
-		this.reengage++;
-		return true;
+		return this.fails.delete(file);
 	}
 
 	/** Replace all state from a replayed append-entry log (fresh map, no carryover). */
 	replay(ops: Iterable<{ op: unknown; file: string; tool?: unknown; feedback?: unknown }>): void {
 		this.fails.clear();
 		this.generation.clear();
-		this.reengage = 0;
 		for (const o of ops) {
 			if (o.op === "set") {
 				this.record(
@@ -898,6 +882,17 @@ export function formatFails(fails: ReadonlyMap<string, FailEntry>): string {
 	return lines.join("\n");
 }
 
+/** Continuation for unresolved per-file FAILs, or undefined to allow the turn to settle. */
+export function stopContinuationForFails(
+	fails: ReadonlyMap<string, FailEntry>,
+): SessionStopEventResult | undefined {
+	if (fails.size === 0) return undefined;
+	return {
+		continue: true,
+		additionalContext: `Unresolved Codex FAIL reviews:\n${formatFails(fails)}`,
+	};
+}
+
 const VERDICT_PREFIX: Record<Verdict, string> = {
 	FAIL: "\u26a0\ufe0f FAIL",
 	PASS: "\u2713 PASS",
@@ -1075,46 +1070,45 @@ export default function codexReflector(pi: HookAPI): void {
 		}
 	});
 
-	// Enforce unresolved FAILs / run a holistic stop review at loop end.
-	pi.on("agent_end", async (event, ctx) => {
+	// session_stop (omp 16.0.5, #2834): main-session-only Stop analog, awaited
+	// before the turn settles, with a native 8-continuation cap. Hook factories
+	// load through the extension runner and receive it at runtime, but HookAPI's
+	// `on` overloads don't list it yet — register the one handler through a typed
+	// view of `pi` (the event lives on the ExtensionAPI surface).
+	type SessionStopRegistrar = {
+		on(
+			event: "session_stop",
+			handler: (
+				event: SessionStopEvent,
+				ctx: HookContext,
+			) => Promise<SessionStopEventResult | undefined> | SessionStopEventResult | undefined,
+		): void;
+	};
+	(pi as unknown as SessionStopRegistrar).on("session_stop", async (event, ctx) => {
 		try {
 			const cwd = ctx.cwd || process.cwd();
 
-			if (tracker.size > 0) {
-				if (tracker.tryReengage(REENGAGE_CAP)) {
-					pi.sendMessage(
-						{
-							customType: "codex-reflector-reengage",
-							content: `Unresolved Codex FAIL reviews:\n${formatFails(tracker.entries())}`,
-							display: true,
-							attribution: "user",
-						},
-						{ triggerTurn: true, deliverAs: "followUp" },
-					);
-				} else {
-					pi.sendMessage(
-						{
-							customType: "codex-reflector-reengage",
-							content: `Codex FAILs remain unresolved after ${REENGAGE_CAP} re-engagements — please resolve manually:\n${formatFails(tracker.entries())}`,
-							display: true,
-							attribution: "agent",
-						},
-						{ triggerTurn: false },
-					);
-				}
-				return;
+			// Per-file FAIL enforcement (cheap, no Codex) — runs on every settle attempt.
+			const failCont = stopContinuationForFails(tracker.entries());
+			if (failCont) {
+				ctx.ui.notify("Codex: unresolved FAIL review(s) — continuing.", "warning");
+				return failCont;
 			}
 
+			// Holistic Stop review (Codex) runs on EVERY settle attempt with no
+			// pending per-file FAILs, so the agent is re-evaluated after it continues;
+			// a one-shot review would let a FAIL/UNCERTAIN settle on the next stop.
+			// The native 8-continuation cap bounds the loop.
+
 			const transcript = renderTranscript(toArray(getProp(event, "messages")));
-			if (!transcript) return;
+			if (!transcript) return undefined;
 			const prompt = await buildStopReviewPrompt(transcript, cwd);
 			const raw = await invokeCodex(prompt, cwd, STOP_REVIEW.effort, STOP_REVIEW.model);
-			if (!raw) return;
+			if (!raw) return undefined;
 			const verdict = parseVerdict(raw);
 			const out = await compactOutput(raw, cwd);
 
 			if (verdict === "PASS") {
-				tracker.resetReengage();
 				pi.sendMessage(
 					{
 						customType: "codex-reflector-stop",
@@ -1124,33 +1118,14 @@ export default function codexReflector(pi: HookAPI): void {
 					},
 					{ triggerTurn: false },
 				);
-				return;
+				return undefined;
 			}
-
-			// FAIL / UNCERTAIN: fail-closed -> re-engage (bounded).
-			if (tracker.tryReengage(REENGAGE_CAP)) {
-				pi.sendMessage(
-					{
-						customType: "codex-reflector-stop",
-						content: `Codex Stop Review ${verdict}:\n${out}`,
-						display: true,
-						attribution: "user",
-					},
-					{ triggerTurn: true, deliverAs: "followUp" },
-				);
-			} else {
-				pi.sendMessage(
-					{
-						customType: "codex-reflector-stop",
-						content: `Codex Stop Review ${verdict} (cap reached):\n${out}`,
-						display: true,
-						attribution: "agent",
-					},
-					{ triggerTurn: false },
-				);
-			}
+			// FAIL / UNCERTAIN: fail-closed -> continue with the review as context.
+			ctx.ui.notify(`Codex Stop Review ${verdict} — continuing.`, "warning");
+			return { continue: true, additionalContext: `Codex Stop Review ${verdict}:\n${out}` };
 		} catch (err) {
-			debug(`agent_end handler error: ${String(err)}`);
+			debug(`session_stop handler error: ${String(err)}`);
+			return undefined; // fail-open: never trap the agent on a hook failure
 		}
 	});
 
