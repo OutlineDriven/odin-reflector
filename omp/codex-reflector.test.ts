@@ -190,9 +190,11 @@ describe("factory", () => {
 		pi: ExtensionAPI;
 		events: string[];
 		handlers: Map<string, (event: unknown, ctx: unknown) => unknown>;
+		sendMessageCalls: unknown[];
 	} {
 		const events: string[] = [];
 		const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+		const sendMessageCalls: unknown[] = [];
 		const stub = {
 			on: (name: string, handler: unknown) => {
 				events.push(name);
@@ -200,10 +202,12 @@ describe("factory", () => {
 					handlers.set(name, handler as (event: unknown, ctx: unknown) => unknown);
 				}
 			},
-			sendMessage: () => {},
+			sendMessage: (msg: unknown) => {
+				sendMessageCalls.push(msg);
+			},
 			logger: { debug() {}, info() {} },
 		};
-		return { pi: stub as unknown as ExtensionAPI, events, handlers };
+		return { pi: stub as unknown as ExtensionAPI, events, handlers, sendMessageCalls };
 	}
 
 	test("registers the three lifecycle handlers", () => {
@@ -238,6 +242,59 @@ describe("factory", () => {
 		);
 		expect(result).toBeUndefined();
 	});
+	// Stop-review settle contract: a PASS/UNCERTAIN verdict must settle SILENTLY —
+	// return undefined AND inject no conversation message. Injecting it via pi.sendMessage
+	// re-enters the conversation, so the agent takes a turn on it, re-stops, and this
+	// holistic review re-runs, looping the Stop on every PASS up to the harness cap. A FAIL
+	// blocks via the returned decision, never via sendMessage. invokeCodex reads its result
+	// from the `-o <outPath>` file (stdout is ignored), so the fake codex parses -o and
+	// writes the verdict there.
+	const STOP_VERDICTS: ReadonlyArray<{ name: string; out: string; blocks: boolean }> = [
+		{ name: "PASS", out: "PASS", blocks: false },
+		{ name: "UNCERTAIN", out: "still investigating", blocks: false },
+		{ name: "FAIL", out: "FAIL: missing guard", blocks: true },
+	];
+	for (const c of STOP_VERDICTS) {
+		test(`session_stop ${c.name} ${c.blocks ? "blocks via decision" : "settles"} without sendMessage`, async () => {
+			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+			writeFileSync(
+				join(binDir, "codex"),
+				`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf '%s\\n' ${JSON.stringify(c.out)} > "$out"\nexit 0\n`,
+			);
+			chmodSync(join(binDir, "codex"), 0o755);
+			const prevPath = process.env.PATH ?? "";
+			process.env.PATH = `${binDir}:${prevPath}`;
+			try {
+				const { pi, handlers, sendMessageCalls } = makePi();
+				codexReflector(pi);
+				const handler = handlers.get("session_stop");
+				expect(handler).toBeDefined();
+				const result = (await handler?.(
+					{
+						type: "session_stop",
+						messages: [
+							{ role: "user", content: "hi" },
+							{ role: "assistant", content: "did work" },
+						],
+						turn_id: 1,
+						session_id: "s",
+						stop_hook_active: false,
+					},
+					{ cwd: ".", hasUI: false, ui: { notify() {} } },
+				)) as { decision?: string; reason?: string } | undefined;
+				if (c.blocks) {
+					expect(result?.decision).toBe("block");
+					expect(result?.reason).toContain("FAIL");
+				} else {
+					expect(result).toBeUndefined();
+				}
+				expect(sendMessageCalls).toHaveLength(0);
+			} finally {
+				process.env.PATH = prevPath;
+				rmSync(binDir, { recursive: true, force: true });
+			}
+		}, 15_000);
+	}
 	test("tool_result fails open when codex hangs (deadline SIGKILLs the child)", async () => {
 		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 		const fake = join(binDir, "codex");

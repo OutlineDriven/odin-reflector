@@ -12,8 +12,8 @@
  *   - thinking:       sequential / shannon MCP                            -> tool_result content
  *   - bash diagnostic:bash (error)                                        -> sendMessage
  *   - fast-apply diag:Fast-Apply MCP (error, Morph payload)              -> sendMessage
- *   - stop review:    session_stop (no pending FAILs, re-run each settle)   -> continue / sendMessage
- *   - FAIL enforce:   session_stop (pending FAILs)                        -> continue
+ *   - stop review:    session_stop (PASS/UNCERTAIN, fresh review)         -> settle (UI notice only)
+ *   - FAIL enforce:   session_stop (FAIL, fresh review)                   -> continue (block decision)
  *   - precompaction:  session_before_compact                             -> sendMessage
  *
  * Delivery-channel rule: oh-my-pi applies a tool_result `content` override only
@@ -1002,18 +1002,14 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			if (!raw) return undefined;
 			const verdict = parseVerdict(raw);
 			const out = await compactOutput(raw, cwd);
-			// PASS / UNCERTAIN settle (display the review); only FAIL blocks.
+			// PASS / UNCERTAIN settle; only a FAIL blocks. Settle SILENTLY: surfacing the
+			// verdict via pi.sendMessage re-enters the conversation (even with triggerTurn:false),
+			// so the agent takes a turn on it, re-stops, and this holistic review re-runs —
+			// looping the Stop on every PASS up to the harness continuation cap. Use a
+			// non-conversation UI notice and return undefined so the stop actually settles.
 			const decision = stopReviewDecision(verdict, out);
 			if (!decision) {
-				pi.sendMessage(
-					{
-						customType: "codex-reflector-stop",
-						content: `Codex Stop Review ${verdict}:\n${out}`,
-						display: true,
-						attribution: "agent",
-					},
-					{ triggerTurn: false },
-				);
+				notifyUI(ctx, `Codex Stop Review ${verdict}.`, "info");
 				return undefined;
 			}
 			notifyUI(ctx, `Codex Stop Review ${verdict} — continuing.`, "warning");
