@@ -1,3 +1,7 @@
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, test } from "bun:test";
 
 import type { ExtensionAPI, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
@@ -8,6 +12,8 @@ import codexReflector, {
 	codeReviewResponse,
 	fileHeuristics,
 	gateModelEffort,
+	handlerDeadline,
+	HANDLER_BUDGET_MS,
 	notifyUI,
 	parseVerdict,
 	redact,
@@ -15,7 +21,24 @@ import codexReflector, {
 	resolveChangeTarget,
 	sandboxContent,
 	stopReviewDecision,
+	testSetHandlerBudgetMs,
 } from "./codex-reflector.ts";
+
+/** Poll until `pid` no longer exists (kill(pid,0) → ESRCH), bounded by timeoutMs.
+ *  invokeCodex resolves on abort before the child's close event fires, so a
+ *  SIGKILLed child may briefly linger; poll rather than checking once. */
+async function waitForPidGone(pid: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return true; // ESRCH — process is gone
+		}
+		await Bun.sleep(25);
+	}
+	return false;
+}
 
 describe("parseVerdict", () => {
 	const cases: ReadonlyArray<[string, "PASS" | "FAIL" | "UNCERTAIN"]> = [
@@ -214,6 +237,209 @@ describe("factory", () => {
 			{ cwd: ".", ui: { notify() {} } },
 		);
 		expect(result).toBeUndefined();
+	});
+	test("tool_result fails open when codex hangs (deadline SIGKILLs the child)", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const fake = join(binDir, "codex");
+		const pidFile = join(binDir, "codex.pid");
+		// echo $$ before exec so the pid file holds the (exec-preserved) sleep PID.
+		writeFileSync(fake, `#!/bin/sh\necho $$ > "${pidFile}"\nexec sleep 30\n`);
+		chmodSync(fake, 0o755);
+		const prevPath = process.env.PATH ?? "";
+		process.env.PATH = `${binDir}:${prevPath}`;
+		testSetHandlerBudgetMs(100); // deadline fires at 100ms
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("tool_result");
+			expect(handler).toBeDefined();
+			const event = {
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: "id",
+				input: { path: "x.ts", content: "const a = 1;" },
+				content: [],
+				isError: false,
+			} as unknown as Parameters<NonNullable<typeof handler>>[0];
+			const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
+				NonNullable<typeof handler>
+			>[1];
+			const start = Date.now();
+			const result = await handler?.(event, ctx);
+			const elapsed = Date.now() - start;
+			expect(result).toBeUndefined(); // fail-open: no review override
+			expect(elapsed).toBeLessThan(5_000); // 100ms deadline fired, not the 25s guard
+			// The deadline must actually SIGKILL the spawned child, not merely resolve.
+			expect(existsSync(pidFile)).toBe(true);
+			const pid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+			expect(Number.isInteger(pid)).toBe(true);
+			expect(await waitForPidGone(pid, 4_000)).toBe(true);
+		} finally {
+			process.env.PATH = prevPath;
+			testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+	test("tool_result deadline also aborts the matryoshka compaction codex call", async () => {
+		// A snippet > MAX_COMPACT_CHARS (400_000) forces compactSnippet → matryoshkaCompact →
+		// codex, exercising the *indirect* codex path. A non-empty invoke log proves matryoshka
+		// actually spawned codex (not a tautological early return); drop the signal forwarding into
+		// matryoshkaCompact and that hung call blocks on the 25s CODEX_TIMEOUT, blowing the 15s
+		// timeout. (The later review call is killed by invokeCodex's post-spawn aborted check
+		// regardless of the line-350 early-spawn guard, so this does not exercise that guard.)
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const invokeLog = join(binDir, "invoked.log");
+		writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> "${invokeLog}"\nexec sleep 30\n`);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		process.env.PATH = `${binDir}:${prevPath}`;
+		testSetHandlerBudgetMs(300); // > redact+spawn of the 420K snippet, << the 5s assert / 25s guard
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("tool_result");
+			expect(handler).toBeDefined();
+			const event = {
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: "id",
+				input: { path: "big.ts", content: "a".repeat(420_000) },
+				content: [],
+				isError: false,
+			} as unknown as Parameters<NonNullable<typeof handler>>[0];
+			const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
+				NonNullable<typeof handler>
+			>[1];
+			const start = Date.now();
+			const result = await handler?.(event, ctx);
+			const elapsed = Date.now() - start;
+			expect(result).toBeUndefined();
+			expect(elapsed).toBeLessThan(5_000);
+			expect(existsSync(invokeLog)).toBe(true); // matryoshka actually invoked codex (indirect path)
+			for (const line of readFileSync(invokeLog, "utf8").split("\n")) {
+				const pid = Number.parseInt(line.trim(), 10);
+				if (Number.isInteger(pid)) expect(await waitForPidGone(pid, 4_000)).toBe(true);
+			}
+		} finally {
+			process.env.PATH = prevPath;
+			testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	// Every handler route with its own final invokeCodex(..., signal) call must fail open under
+	// the deadline when codex hangs. Drop the signal arg from any one route's call and invokeCodex
+	// gets no extraSignal — neither the early guard (codex-reflector.ts:350) nor the post-spawn
+	// kill (:395-402) runs — so that route blocks on the 25s CODEX_TIMEOUT and blows the 15s
+	// timeout. The invoke-log assertion guards against a mis-shaped event short-circuiting to
+	// undefined before reaching invokeCodex (which would pass tautologically).
+	const HANGING_ROUTES: ReadonlyArray<{ label: string; handler: string; event: Record<string, unknown> }> = [
+		{
+			label: "tool_result/thinking",
+			handler: "tool_result",
+			event: { type: "tool_result", toolName: "mcp__sequentialthinking", toolCallId: "id", input: { thought: "x" }, content: [], isError: false },
+		},
+		{
+			label: "tool_result/bash_failure",
+			handler: "tool_result",
+			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: [{ type: "text", text: "boom" }], isError: true },
+		},
+		{
+			label: "tool_result/code_change_failure",
+			handler: "tool_result",
+			event: { type: "tool_result", toolName: "mcp__morph__edit_file", toolCallId: "id", input: { path: "x.ts", code_edit: "EDIT", instruction: "DO" }, content: [], isError: true },
+		},
+		{
+			label: "session_stop (nonempty transcript)",
+			handler: "session_stop",
+			event: { type: "session_stop", messages: [{ role: "user", content: "hello" }, { role: "assistant", content: "did work" }], turn_id: 1, session_id: "s", stop_hook_active: false },
+		},
+		{
+			label: "session_before_compact (nonempty transcript)",
+			handler: "session_before_compact",
+			event: { type: "session_before_compact", preparation: { messagesToSummarize: [{ role: "user", content: "work to reflect on" }] } },
+		},
+	];
+	for (const route of HANGING_ROUTES) {
+		test(`route ${route.label} fails open when codex hangs`, async () => {
+			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+			const invokeLog = join(binDir, "invoked.log");
+			writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> "${invokeLog}"\nexec sleep 30\n`);
+			chmodSync(join(binDir, "codex"), 0o755);
+			const prevPath = process.env.PATH ?? "";
+			process.env.PATH = `${binDir}:${prevPath}`;
+			testSetHandlerBudgetMs(300); // > spawn+log time, << the 5s assert / 25s guard
+			try {
+				const { pi, handlers } = makePi();
+				codexReflector(pi);
+				const handler = handlers.get(route.handler);
+				expect(handler).toBeDefined();
+				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
+					NonNullable<typeof handler>
+				>[1];
+				const start = Date.now();
+				const result = await handler?.(
+					route.event as unknown as Parameters<NonNullable<typeof handler>>[0],
+					ctx,
+				);
+				const elapsed = Date.now() - start;
+				expect(result).toBeUndefined(); // fail-open on every route
+				expect(elapsed).toBeLessThan(5_000); // deadline fired, not the 25s guard
+				expect(existsSync(invokeLog)).toBe(true); // route actually reached invokeCodex
+				// The deadline must SIGKILL the spawned child, not just resolve — else a broken
+				// abort path leaks a sleep-30 child. Poll each logged PID (resolve precedes close).
+				for (const line of readFileSync(invokeLog, "utf8").split("\n")) {
+					const pid = Number.parseInt(line.trim(), 10);
+					if (Number.isInteger(pid)) expect(await waitForPidGone(pid, 4_000)).toBe(true);
+				}
+			} finally {
+				process.env.PATH = prevPath;
+				testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
+				rmSync(binDir, { recursive: true, force: true });
+			}
+		}, 15_000);
+	}
+});
+
+describe("handlerDeadline", () => {
+	test("aborts after the budget elapses", async () => {
+		const d = handlerDeadline(undefined, 10);
+		expect(d.signal.aborted).toBe(false);
+		await new Promise<void>((r) =>
+			d.signal.addEventListener("abort", () => r(), { once: true }),
+		);
+		expect(d.signal.aborted).toBe(true);
+		d.clear();
+	});
+
+	test("clear() cancels the pending abort", async () => {
+		const d = handlerDeadline(undefined, 10);
+		d.clear();
+		await Bun.sleep(50);
+		expect(d.signal.aborted).toBe(false);
+	});
+
+	test("aborts immediately when upstream is already aborted", () => {
+		const d = handlerDeadline(AbortSignal.abort(), 10_000);
+		expect(d.signal.aborted).toBe(true);
+		d.clear();
+	});
+
+	test("propagates a later upstream abort", () => {
+		const ac = new AbortController();
+		const d = handlerDeadline(ac.signal, 10_000);
+		expect(d.signal.aborted).toBe(false);
+		ac.abort();
+		expect(d.signal.aborted).toBe(true);
+		d.clear();
+	});
+
+	test("clear() removes the upstream listener (no late abort, no leak)", () => {
+		const ac = new AbortController();
+		const d = handlerDeadline(ac.signal, 10_000);
+		d.clear();
+		ac.abort(); // fires AFTER clear — must not reach the deadline's controller
+		expect(d.signal.aborted).toBe(false);
 	});
 });
 

@@ -44,7 +44,17 @@ const FAST_MODEL = "gpt-5.4-mini"; // 1M context window
 
 const MAX_COMPACT_CHARS = 400_000; // ~100K tokens — trigger matryoshka above this
 const COMPACT_THRESHOLD = 1500; // chars — re-summarize verbose codex output above this
-const CODEX_TIMEOUT_MS = 100_000;
+const CODEX_TIMEOUT_MS = 25_000;
+// Per-handler budget shared across all codex calls in one handler invocation.
+// Must stay under oh-my-pi's fixed EXTENSION_HANDLER_TIMEOUT_MS (30_000ms): the
+// harness kills a handler at 30s without aborting it, orphaning the codex child.
+export const HANDLER_BUDGET_MS = 25_000;
+let handlerBudgetMs = HANDLER_BUDGET_MS;
+/** Test-only: shrink the per-handler budget so the deadline can be exercised
+ *  without a 25s wait. Restore with testSetHandlerBudgetMs(HANDLER_BUDGET_MS). */
+export function testSetHandlerBudgetMs(ms: number): void {
+	handlerBudgetMs = ms;
+}
 
 type Effort = "low" | "medium" | "high" | "xhigh";
 type Category = "code_change" | "thinking" | "bash_failure" | "code_change_failure";
@@ -337,6 +347,7 @@ async function invokeCodex(
 	model: string,
 	extraSignal?: AbortSignal,
 ): Promise<string> {
+	if (extraSignal?.aborted) return ""; // deadline already fired — do not spawn
 	const m = process.env.CODEX_REFLECTOR_MODEL || model || DEFAULT_MODEL;
 	let e: Effort = effort;
 	// Lightning-fast model needs at least high effort.
@@ -412,6 +423,31 @@ async function invokeCodex(
 			/* best-effort cleanup */
 		}
 	}
+}
+
+/** Per-handler deadline: an AbortController that aborts after `budgetMs`
+ * (default = the test-settable handlerBudgetMs, under oh-my-pi's 30s handler
+ * cap), optionally chained to an upstream signal (aborts if either fires).
+ * Caller MUST call clear() in finally to cancel the timer and detach the
+ * upstream listener. */
+export function handlerDeadline(
+	upstream?: AbortSignal,
+	budgetMs = handlerBudgetMs,
+): { signal: AbortSignal; clear: () => void } {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), budgetMs);
+	const onUpstream = (): void => controller.abort();
+	if (upstream) {
+		if (upstream.aborted) controller.abort();
+		else upstream.addEventListener("abort", onUpstream, { once: true });
+	}
+	return {
+		signal: controller.signal,
+		clear: (): void => {
+			clearTimeout(timer);
+			if (upstream) upstream.removeEventListener("abort", onUpstream);
+		},
+	};
 }
 
 /** Recursive semantic summarization via FAST_MODEL; fail-open to truncation. */
@@ -496,6 +532,7 @@ async function buildThinkingPrompt(
 	toolName: string,
 	input: Record<string, unknown>,
 	cwd: string,
+	signal?: AbortSignal,
 ): Promise<string> {
 	const thoughtNum = input.thought_number ?? input.thoughtNumber ?? 0;
 	const total = input.total_thoughts ?? input.totalThoughts ?? 0;
@@ -521,7 +558,7 @@ async function buildThinkingPrompt(
 
 	const sandboxed = sandboxContent(
 		"reasoning-step",
-		await matryoshkaCompact(redact(text), 100_000, cwd),
+		await matryoshkaCompact(redact(text), 100_000, cwd, 3, signal),
 	);
 
 	return (
@@ -550,6 +587,7 @@ async function buildBashFailurePrompt(
 	error: string,
 	responseInfo: string,
 	cwd: string,
+	signal?: AbortSignal,
 ): Promise<string> {
 	const extra: string[] = [];
 	if (["npm", "yarn", "pnpm", "bun"].some((x) => command.includes(x)))
@@ -568,7 +606,7 @@ async function buildBashFailurePrompt(
 	const extraBlock = extra.length
 		? "\n\nContext-specific:\n" + extra.map((x) => `- ${x}`).join("\n")
 		: "";
-	const compactedError = await matryoshkaCompact(redact(error), 20_000, cwd);
+	const compactedError = await matryoshkaCompact(redact(error), 20_000, cwd, 3, signal);
 	const failureData = sandboxContent(
 		"failed-command",
 		`Command: ${redact(command)}\nError: ${compactedError}`,
@@ -620,8 +658,8 @@ Be concise and actionable.` + COMPACT_ANALYSIS
 	);
 }
 
-async function buildStopReviewPrompt(transcript: string, cwd: string): Promise<string> {
-	const truncated = await matryoshkaCompact(redact(transcript), MAX_COMPACT_CHARS, cwd);
+async function buildStopReviewPrompt(transcript: string, cwd: string, signal?: AbortSignal): Promise<string> {
+	const truncated = await matryoshkaCompact(redact(transcript), MAX_COMPACT_CHARS, cwd, 3, signal);
 	const sandboxed = sandboxContent("transcript", truncated);
 	const extra: string[] = [];
 	if (transcript.length > 40_000)
@@ -808,8 +846,8 @@ export function resolveChangeTarget(event: ToolResultEvent): {
 }
 
 /** Redact then compact a raw snippet for review (matryoshka bounds the codex input, fail-open). */
-async function compactSnippet(rawSnippet: string, cwd: string): Promise<string> {
-	return matryoshkaCompact(redact(rawSnippet), MAX_COMPACT_CHARS, cwd);
+async function compactSnippet(rawSnippet: string, cwd: string, signal?: AbortSignal): Promise<string> {
+	return matryoshkaCompact(redact(rawSnippet), MAX_COMPACT_CHARS, cwd, 3, signal);
 }
 
 // ---------------------------------------------------------------------------
@@ -859,18 +897,20 @@ export default function codexReflector(pi: ExtensionAPI): void {
 
 	// Review code changes / diagnose failures on each tool result.
 	pi.on("tool_result", async (event, ctx) => {
+		let deadline: ReturnType<typeof handlerDeadline> | undefined;
 		try {
 			const routed = classify(event.toolName, event.isError ?? false, event.input);
 			if (!routed) return undefined;
 			const cwd = ctx.cwd || process.cwd();
-
+			deadline = handlerDeadline();
+			const signal = deadline.signal;
 			if (routed.category === "code_change") {
 				const { filePath, rawSnippet } = resolveChangeTarget(event);
-				const snippet = await compactSnippet(rawSnippet, cwd);
+				const snippet = await compactSnippet(rawSnippet, cwd, signal);
 				const preset = gateModelEffort("code_change", filePath, snippet);
 				const extraFocus = [...fileHeuristics(filePath), ...changeSizeHeuristics(snippet.length)];
 				const prompt = buildCodeReviewPrompt(event.toolName, filePath, snippet, "", extraFocus);
-				const raw = await invokeCodex(prompt, cwd, preset.effort, preset.model);
+				const raw = await invokeCodex(prompt, cwd, preset.effort, preset.model, signal);
 				if (!raw) return undefined;
 				const verdict = parseVerdict(raw);
 				const out = await compactOutput(raw, cwd);
@@ -879,8 +919,8 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			}
 
 			if (routed.category === "thinking") {
-				const prompt = await buildThinkingPrompt(event.toolName, event.input, cwd);
-				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model);
+				const prompt = await buildThinkingPrompt(event.toolName, event.input, cwd, signal);
+				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model, signal);
 				if (!raw) return undefined;
 				const out = await compactOutput(raw, cwd);
 				return {
@@ -893,8 +933,8 @@ export default function codexReflector(pi: ExtensionAPI): void {
 
 			if (routed.category === "bash_failure") {
 				const command = typeof event.input.command === "string" ? event.input.command : "unknown";
-				const prompt = await buildBashFailurePrompt(command, textOf(event.content), "", cwd);
-				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model);
+				const prompt = await buildBashFailurePrompt(command, textOf(event.content), "", cwd, signal);
+				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model, signal);
 				if (raw) {
 					const out = await compactOutput(raw, cwd);
 					pi.sendMessage(
@@ -922,7 +962,7 @@ export default function codexReflector(pi: ExtensionAPI): void {
 					codeEdit,
 					instruction,
 				);
-				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model);
+				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model, signal);
 				if (raw) {
 					const out = await compactOutput(raw, cwd);
 					pi.sendMessage(
@@ -942,18 +982,23 @@ export default function codexReflector(pi: ExtensionAPI): void {
 		} catch (err) {
 			debug(`tool_result handler error: ${String(err)}`);
 			return undefined; // fail-open
+		} finally {
+			deadline?.clear();
 		}
 	});
 
 	// session_stop (omp 16.0.5, #2834): main-session-only Stop analog, awaited
 	// before the turn settles, bounded by omp's built-in 8-continuation cap.
 	pi.on("session_stop", async (event, ctx) => {
+		let deadline: ReturnType<typeof handlerDeadline> | undefined;
 		try {
 			const cwd = ctx.cwd || process.cwd();
 			const transcript = renderTranscript(toArray(getProp(event, "messages")));
 			if (!transcript) return undefined;
-			const prompt = await buildStopReviewPrompt(transcript, cwd);
-			const raw = await invokeCodex(prompt, cwd, STOP_REVIEW.effort, STOP_REVIEW.model);
+			deadline = handlerDeadline();
+			const signal = deadline.signal;
+			const prompt = await buildStopReviewPrompt(transcript, cwd, signal);
+			const raw = await invokeCodex(prompt, cwd, STOP_REVIEW.effort, STOP_REVIEW.model, signal);
 			if (!raw) return undefined;
 			const verdict = parseVerdict(raw);
 			const out = await compactOutput(raw, cwd);
@@ -976,24 +1021,29 @@ export default function codexReflector(pi: ExtensionAPI): void {
 		} catch (err) {
 			debug(`session_stop handler error: ${String(err)}`);
 			return undefined;
+		} finally {
+			deadline?.clear();
 		}
 	});
 
 	// Surface session metacognition before compaction (advisory; never alters compaction).
 	pi.on("session_before_compact", async (event, ctx) => {
+		let deadline: ReturnType<typeof handlerDeadline> | undefined;
 		try {
 			const cwd = ctx.cwd || process.cwd();
 			const transcript = renderTranscript(extractPrepMessages(event));
 			if (!transcript) return;
 			const rawSignal = getProp(event, "signal");
 			const sig = rawSignal instanceof AbortSignal ? rawSignal : undefined;
-			const prompt = await buildPrecompactPrompt(transcript, cwd, sig);
+			deadline = handlerDeadline(sig);
+			const signal = deadline.signal;
+			const prompt = await buildPrecompactPrompt(transcript, cwd, signal);
 			const raw = await invokeCodex(
 				prompt,
 				cwd,
 				PRECOMPACT.effort,
 				PRECOMPACT.model,
-				sig,
+				signal,
 			);
 			if (!raw) return;
 			pi.sendMessage(
@@ -1007,6 +1057,8 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			);
 		} catch (err) {
 			debug(`precompact handler error: ${String(err)}`);
+		} finally {
+			deadline?.clear();
 		}
 	});
 }
