@@ -456,6 +456,76 @@ describe("factory", () => {
 			}
 		}, 15_000);
 	}
+
+	// Each builder route threads `signal` into its OWN matryoshkaCompact(..., signal) call
+	// (codex-reflector.ts:561/609/662/702), separate from the final invokeCodex that
+	// HANGING_ROUTES covers. With tiny inputs those compaction calls return early (text <=
+	// maxChars) and never spawn codex, so the tiny table cannot catch a dropped signal there.
+	// Feed each route an input ABOVE its builder's matryoshkaCompact maxChars threshold so the
+	// builder's own compaction call spawns codex and the deadline must SIGKILL it — mirroring
+	// the 420K compactSnippet test for the remaining builder routes. Sizes account for the 8000
+	// per-part / per-message cap in textOf/renderTranscript (thinking reads input.thought raw).
+	const HANGING_COMPACTION_ROUTES: ReadonlyArray<{ label: string; handler: string; event: Record<string, unknown> }> = [
+		{
+			label: "tool_result/thinking (thought > 100k compaction threshold)",
+			handler: "tool_result",
+			event: { type: "tool_result", toolName: "mcp__sequentialthinking", toolCallId: "id", input: { thought: "a".repeat(110_000) }, content: [], isError: false },
+		},
+		{
+			label: "tool_result/bash_failure (error > 20k compaction threshold)",
+			handler: "tool_result",
+			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: Array.from({ length: 4 }, () => ({ type: "text", text: "a".repeat(8000) })), isError: true },
+		},
+		{
+			label: "session_stop (transcript > 400k compaction threshold)",
+			handler: "session_stop",
+			event: { type: "session_stop", messages: Array.from({ length: 55 }, () => ({ role: "user", content: "a".repeat(8000) })), turn_id: 1, session_id: "s", stop_hook_active: false },
+		},
+		{
+			label: "session_before_compact (transcript > 400k compaction threshold)",
+			handler: "session_before_compact",
+			event: { type: "session_before_compact", preparation: { messagesToSummarize: Array.from({ length: 55 }, () => ({ role: "user", content: "a".repeat(8000) })) } },
+		},
+	];
+	for (const route of HANGING_COMPACTION_ROUTES) {
+		test(`route ${route.label} fails open when the builder's matryoshka codex call hangs`, async () => {
+			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+			const invokeLog = join(binDir, "invoked.log");
+			writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> "${invokeLog}"\nexec sleep 30\n`);
+			chmodSync(join(binDir, "codex"), 0o755);
+			const prevPath = process.env.PATH ?? "";
+			process.env.PATH = `${binDir}:${prevPath}`;
+			testSetHandlerBudgetMs(300); // > redact+spawn of the large input, << the 5s assert / 25s guard
+			try {
+				const { pi, handlers } = makePi();
+				codexReflector(pi);
+				const handler = handlers.get(route.handler);
+				expect(handler).toBeDefined();
+				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
+					NonNullable<typeof handler>
+				>[1];
+				const start = Date.now();
+				const result = await handler?.(
+					route.event as unknown as Parameters<NonNullable<typeof handler>>[0],
+					ctx,
+				);
+				const elapsed = Date.now() - start;
+				expect(result).toBeUndefined(); // fail-open on the indirect compaction path
+				expect(elapsed).toBeLessThan(5_000); // deadline fired, not the 25s guard
+				expect(existsSync(invokeLog)).toBe(true); // the builder's matryoshkaCompact actually spawned codex
+				// The deadline must SIGKILL each spawned child (matryoshka's, plus the final
+				// invoke if it spawned), not merely resolve. Poll each logged PID.
+				for (const line of readFileSync(invokeLog, "utf8").split("\n")) {
+					const pid = Number.parseInt(line.trim(), 10);
+					if (Number.isInteger(pid)) expect(await waitForPidGone(pid, 4_000)).toBe(true);
+				}
+			} finally {
+				process.env.PATH = prevPath;
+				testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
+				rmSync(binDir, { recursive: true, force: true });
+			}
+		}, 15_000);
+	}
 });
 
 describe("handlerDeadline", () => {
