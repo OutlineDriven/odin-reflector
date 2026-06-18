@@ -47,6 +47,9 @@ This file is only for repo-specific constraints that are easy to break and expen
 - **Rule:** Pre-compaction reflection is advisory only.
   **Why:** The hook should surface metacognition before compaction without mutating the compaction operation or session state.
 
+- **Rule:** Every `invokeCodex` call inside an OMP handler MUST receive a shared per-handler `handlerDeadline()` signal (`HANDLER_BUDGET_MS`, kept under oh-my-pi's fixed 30s `EXTENSION_HANDLER_TIMEOUT_MS`), threaded through `compactSnippet`/`matryoshkaCompact` and the async prompt builders, with `deadline.clear()` in a `finally`. `invokeCodex`'s own `CODEX_TIMEOUT_MS` stays under that cap too.
+  **Why:** The harness caps a handler at 30s via `Promise.race` without aborting it, so a hung `codex` child outlives the cap — the review is dropped and the child is orphaned (the `handler timed out after 30000ms` failure mode). The shared deadline SIGKILLs the child and fails the handler open before the cap. OMP-only: the Python plugin's Claude-hook timeouts (>=120s) sit above its 100s guard, so no 30s race exists there.
+
 ## Safety invariants
 
 - **Rule:** Redact secrets before sending prompts to Codex, and keep untrusted tool/transcript data sandboxed where that prompt path supports sandbox wrappers. Keep `codex exec` read-only/ephemeral and fail-open on invocation errors.
