@@ -304,7 +304,7 @@ describe("factory", () => {
 		chmodSync(fake, 0o755);
 		const prevPath = process.env.PATH ?? "";
 		process.env.PATH = `${binDir}:${prevPath}`;
-		testSetHandlerBudgetMs(100); // deadline fires at 100ms
+		testSetHandlerBudgetMs(300); // deadline fires at 300ms (> spawn+log, << the 5s assert / 25s guard)
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
