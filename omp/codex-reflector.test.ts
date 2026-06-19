@@ -295,17 +295,17 @@ describe("factory", () => {
 			}
 		}, 15_000);
 	}
-	// Per-tool code-review enforcement: a FAIL verdict must BLOCK by returning
-	// isError:true (ExtensionToolWrapper rethrows an isError success result as a
-	// failed tool call); PASS/UNCERTAIN stay advisory (content only — fail-open).
+	// Per-tool code-review is advisory: every verdict (PASS/UNCERTAIN/FAIL) rides along as
+	// appended content and NONE sets isError, so a succeeded edit/command is never blocked.
+	// Enforcement lives in the holistic session_stop review (see STOP_VERDICTS), not here.
 	// The fake codex writes the verdict to the -o file (invokeCodex ignores stdout).
-	const CODE_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string; blocks: boolean }> = [
-		{ name: "PASS", out: "PASS", blocks: false },
-		{ name: "UNCERTAIN", out: "still investigating", blocks: false },
-		{ name: "FAIL", out: "FAIL: missing guard", blocks: true },
+	const CODE_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string }> = [
+		{ name: "PASS", out: "PASS" },
+		{ name: "UNCERTAIN", out: "still investigating" },
+		{ name: "FAIL", out: "FAIL: missing guard" },
 	];
 	for (const c of CODE_REVIEW_VERDICTS) {
-		test(`tool_result code_change ${c.name} ${c.blocks ? "blocks via isError" : "stays advisory"}`, async () => {
+		test(`tool_result code_change ${c.name} stays advisory`, async () => {
 			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 			writeFileSync(
 				join(binDir, "codex"),
@@ -334,11 +334,7 @@ describe("factory", () => {
 					| { content?: Array<{ type: string; text: string }>; isError?: boolean }
 					| undefined;
 				expect(result).toBeDefined();
-				if (c.blocks) {
-					expect(result?.isError).toBe(true);
-				} else {
-					expect(result?.isError).toBeFalsy();
-				}
+				expect(result?.isError).toBeFalsy();
 				const last = result?.content?.at(-1);
 				expect(last?.type).toBe("text");
 				expect(last?.text).toContain(c.name);
@@ -349,13 +345,13 @@ describe("factory", () => {
 		}, 15_000);
 	}
 	// Successful bash command review: same PASS/UNCERTAIN/FAIL contract as code_change.
-	const BASH_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string; blocks: boolean }> = [
-		{ name: "PASS", out: "PASS", blocks: false },
-		{ name: "UNCERTAIN", out: "still investigating", blocks: false },
-		{ name: "FAIL", out: "FAIL: leaked secret", blocks: true },
+	const BASH_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string }> = [
+		{ name: "PASS", out: "PASS" },
+		{ name: "UNCERTAIN", out: "still investigating" },
+		{ name: "FAIL", out: "FAIL: leaked secret" },
 	];
 	for (const c of BASH_REVIEW_VERDICTS) {
-		test(`tool_result bash_success ${c.name} ${c.blocks ? "blocks via isError" : "stays advisory"}`, async () => {
+		test(`tool_result bash_success ${c.name} stays advisory`, async () => {
 			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 			writeFileSync(
 				join(binDir, "codex"),
@@ -384,11 +380,9 @@ describe("factory", () => {
 					| { content?: Array<{ type: string; text: string }>; isError?: boolean }
 					| undefined;
 				expect(result).toBeDefined();
-				if (c.blocks) {
-					expect(result?.isError).toBe(true);
-				} else {
-					expect(result?.isError).toBeFalsy();
-				}
+				expect(result?.isError).toBeFalsy();
+				expect(result?.content).toHaveLength(2);
+				expect(result?.content?.[0]).toEqual({ type: "text", text: "ok" });
 				const last = result?.content?.at(-1);
 				expect(last?.type).toBe("text");
 				expect(last?.text).toContain(c.name);
@@ -791,9 +785,9 @@ describe("codeReviewResponse", () => {
 		expect(last.text).toContain("PASS");
 		expect(last.text).toContain("looks correct");
 	});
-	test("FAIL sets isError to block (harness rethrows it as a failed tool call)", () => {
+	test("FAIL stays advisory (no isError — per-tool reviews never block)", () => {
 		const r = codeReviewResponse("FAIL", "a.ts", "missing guard", []);
-		expect(r.isError).toBe(true);
+		expect(r.isError).toBeFalsy();
 		const last = r.content?.at(-1) as { type: string; text: string };
 		expect(last.text).toContain("FAIL");
 		expect(last.text).toContain("missing guard");

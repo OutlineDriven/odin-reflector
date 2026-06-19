@@ -9,7 +9,7 @@
  *
  * Coverage (oh-my-pi native tool names):
  *   - side-effect review: write / edit / ast_edit / bash + Fast-Apply MCP (success)
- *                      -> tool_result content; FAIL -> isError (block)
+ *                      -> tool_result content (advisory, every verdict; never blocks)
  *   - thinking:       sequential / shannon MCP                            -> tool_result content
  *   - bash diagnostic:bash (error; already failed tool call)              -> sendMessage
  *   - fast-apply diag:Fast-Apply MCP (error, Morph payload; already failed tool call)
@@ -18,11 +18,12 @@
  *   - FAIL enforce:   session_stop (FAIL, fresh review)                   -> continue (block decision)
  *   - precompaction:  session_before_compact                             -> sendMessage
  *
- * Delivery-channel rule: oh-my-pi applies a tool_result `content`/`isError`
- * override only on the SUCCESS path; a FAIL side-effect review sets isError:true
- * there, and the extensions tool wrapper rethrows that success result as a failed
- * tool call. On a genuine tool error, the tool call is already failed; keep the
- * original error and send supplemental diagnostics via `pi.sendMessage`.
+ * Delivery-channel rule: side-effect reviews are advisory — oh-my-pi applies a
+ * tool_result `content` override on the SUCCESS path for every verdict and the
+ * review never sets isError, so a succeeded edit/command is never rethrown as a
+ * failed tool call. On a genuine tool error, the tool call is already failed; keep
+ * the original error and send supplemental diagnostics via `pi.sendMessage`. The
+ * holistic Stop review is the sole block.
  *
  * Env vars: CODEX_REFLECTOR_ENABLED ("0" disables), CODEX_REFLECTOR_MODEL
  * (override all model selections), CODEX_REFLECTOR_DEBUG ("1" for logger diag).
@@ -888,10 +889,10 @@ async function compactSnippet(rawSnippet: string, cwd: string, signal?: AbortSig
 // Review response builder
 // ---------------------------------------------------------------------------
 
-/** Build the tool_result result for a side-effect review. PASS/UNCERTAIN are
- * advisory (content override only). A FAIL sets isError:true so the extensions
- * tool wrapper (ExtensionToolWrapper) rethrows the succeeded tool call as a failed
- * call — blocking it (fail-open: only a definitive FAIL blocks). */
+/** Build the tool_result result for a side-effect review. All verdicts are
+ * advisory: the verdict + opinion ride along as a content override and the result
+ * never sets isError, so a succeeded edit/command is never blocked. The holistic
+ * Stop review (stopReviewDecision) is the sole gate. */
 export function codeReviewResponse(
 	verdict: Verdict,
 	filePath: string,
@@ -904,7 +905,6 @@ export function codeReviewResponse(
 			{ type: "text" as const, text: `Codex Review ${VERDICT_PREFIX[verdict]} [${filePath}]:\n${out}` },
 		],
 	};
-	if (verdict === "FAIL") result.isError = true;
 	return result;
 }
 
