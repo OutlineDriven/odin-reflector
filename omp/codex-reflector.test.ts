@@ -69,9 +69,9 @@ describe("classify", () => {
 		expect(classify("edit", false)?.category).toBe("code_change");
 		expect(classify("ast_edit", false)?.category).toBe("code_change");
 	});
-	test("bash failure -> bash_failure, bash success -> null", () => {
+	test("bash failure -> bash_failure, bash success -> bash_success", () => {
 		expect(classify("bash", true)?.category).toBe("bash_failure");
-		expect(classify("bash", false)).toBeNull();
+		expect(classify("bash", false)?.category).toBe("bash_success");
 	});
 	test("non-reviewed tools -> null", () => {
 		expect(classify("read", false)).toBeNull();
@@ -295,6 +295,109 @@ describe("factory", () => {
 			}
 		}, 15_000);
 	}
+	// Per-tool code-review enforcement: a FAIL verdict must BLOCK by returning
+	// isError:true (ExtensionToolWrapper rethrows an isError success result as a
+	// failed tool call); PASS/UNCERTAIN stay advisory (content only — fail-open).
+	// The fake codex writes the verdict to the -o file (invokeCodex ignores stdout).
+	const CODE_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string; blocks: boolean }> = [
+		{ name: "PASS", out: "PASS", blocks: false },
+		{ name: "UNCERTAIN", out: "still investigating", blocks: false },
+		{ name: "FAIL", out: "FAIL: missing guard", blocks: true },
+	];
+	for (const c of CODE_REVIEW_VERDICTS) {
+		test(`tool_result code_change ${c.name} ${c.blocks ? "blocks via isError" : "stays advisory"}`, async () => {
+			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+			writeFileSync(
+				join(binDir, "codex"),
+				`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf '%s\\n' ${JSON.stringify(c.out)} > "$out"\nexit 0\n`,
+			);
+			chmodSync(join(binDir, "codex"), 0o755);
+			const prevPath = process.env.PATH ?? "";
+			process.env.PATH = `${binDir}:${prevPath}`;
+			try {
+				const { pi, handlers } = makePi();
+				codexReflector(pi);
+				const handler = handlers.get("tool_result");
+				expect(handler).toBeDefined();
+				const event = {
+					type: "tool_result",
+					toolName: "write",
+					toolCallId: "id",
+					input: { path: "x.ts", content: "const a = 1;" },
+					content: [],
+					isError: false,
+				} as unknown as Parameters<NonNullable<typeof handler>>[0];
+				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
+					NonNullable<typeof handler>
+				>[1];
+				const result = (await handler?.(event, ctx)) as
+					| { content?: Array<{ type: string; text: string }>; isError?: boolean }
+					| undefined;
+				expect(result).toBeDefined();
+				if (c.blocks) {
+					expect(result?.isError).toBe(true);
+				} else {
+					expect(result?.isError).toBeFalsy();
+				}
+				const last = result?.content?.at(-1);
+				expect(last?.type).toBe("text");
+				expect(last?.text).toContain(c.name);
+			} finally {
+				process.env.PATH = prevPath;
+				rmSync(binDir, { recursive: true, force: true });
+			}
+		}, 15_000);
+	}
+	// Successful bash command review: same PASS/UNCERTAIN/FAIL contract as code_change.
+	const BASH_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string; blocks: boolean }> = [
+		{ name: "PASS", out: "PASS", blocks: false },
+		{ name: "UNCERTAIN", out: "still investigating", blocks: false },
+		{ name: "FAIL", out: "FAIL: leaked secret", blocks: true },
+	];
+	for (const c of BASH_REVIEW_VERDICTS) {
+		test(`tool_result bash_success ${c.name} ${c.blocks ? "blocks via isError" : "stays advisory"}`, async () => {
+			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+			writeFileSync(
+				join(binDir, "codex"),
+				`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf '%s\\n' ${JSON.stringify(c.out)} > "$out"\nexit 0\n`,
+			);
+			chmodSync(join(binDir, "codex"), 0o755);
+			const prevPath = process.env.PATH ?? "";
+			process.env.PATH = `${binDir}:${prevPath}`;
+			try {
+				const { pi, handlers } = makePi();
+				codexReflector(pi);
+				const handler = handlers.get("tool_result");
+				expect(handler).toBeDefined();
+				const event = {
+					type: "tool_result",
+					toolName: "bash",
+					toolCallId: "id",
+					input: { command: "ls" },
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+				} as unknown as Parameters<NonNullable<typeof handler>>[0];
+				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
+					NonNullable<typeof handler>
+				>[1];
+				const result = (await handler?.(event, ctx)) as
+					| { content?: Array<{ type: string; text: string }>; isError?: boolean }
+					| undefined;
+				expect(result).toBeDefined();
+				if (c.blocks) {
+					expect(result?.isError).toBe(true);
+				} else {
+					expect(result?.isError).toBeFalsy();
+				}
+				const last = result?.content?.at(-1);
+				expect(last?.type).toBe("text");
+				expect(last?.text).toContain(c.name);
+			} finally {
+				process.env.PATH = prevPath;
+				rmSync(binDir, { recursive: true, force: true });
+			}
+		}, 15_000);
+	}
 	test("tool_result fails open when codex hangs (deadline SIGKILLs the child)", async () => {
 		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 		const fake = join(binDir, "codex");
@@ -402,6 +505,11 @@ describe("factory", () => {
 			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: [{ type: "text", text: "boom" }], isError: true },
 		},
 		{
+			label: "tool_result/bash_success",
+			handler: "tool_result",
+			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: [{ type: "text", text: "ok" }], isError: false },
+		},
+		{
 			label: "tool_result/code_change_failure",
 			handler: "tool_result",
 			event: { type: "tool_result", toolName: "mcp__morph__edit_file", toolCallId: "id", input: { path: "x.ts", code_edit: "EDIT", instruction: "DO" }, content: [], isError: true },
@@ -458,8 +566,8 @@ describe("factory", () => {
 	}
 
 	// Each builder route threads `signal` into its OWN matryoshkaCompact(..., signal) call
-	// (codex-reflector.ts:561/609/662/702), separate from the final invokeCodex that
-	// HANGING_ROUTES covers. With tiny inputs those compaction calls return early (text <=
+	// (see the builder functions in codex-reflector.ts), separate from the final invokeCodex
+	// that HANGING_ROUTES covers. With tiny inputs those compaction calls return early (text <=
 	// maxChars) and never spawn codex, so the tiny table cannot catch a dropped signal there.
 	// Feed each route an input ABOVE its builder's matryoshkaCompact maxChars threshold so the
 	// builder's own compaction call spawns codex and the deadline must SIGKILL it — mirroring
@@ -475,6 +583,11 @@ describe("factory", () => {
 			label: "tool_result/bash_failure (error > 20k compaction threshold)",
 			handler: "tool_result",
 			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: Array.from({ length: 4 }, () => ({ type: "text", text: "a".repeat(8000) })), isError: true },
+		},
+		{
+			label: "tool_result/bash_success (output > 20k compaction threshold)",
+			handler: "tool_result",
+			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: Array.from({ length: 4 }, () => ({ type: "text", text: "a".repeat(8000) })), isError: false },
 		},
 		{
 			label: "session_stop (transcript > 400k compaction threshold)",
@@ -677,6 +790,17 @@ describe("codeReviewResponse", () => {
 		expect(last.type).toBe("text");
 		expect(last.text).toContain("PASS");
 		expect(last.text).toContain("looks correct");
+	});
+	test("FAIL sets isError to block (harness rethrows it as a failed tool call)", () => {
+		const r = codeReviewResponse("FAIL", "a.ts", "missing guard", []);
+		expect(r.isError).toBe(true);
+		const last = r.content?.at(-1) as { type: string; text: string };
+		expect(last.text).toContain("FAIL");
+		expect(last.text).toContain("missing guard");
+	});
+	test("PASS and UNCERTAIN stay advisory (no isError — fail-open)", () => {
+		expect(codeReviewResponse("PASS", "a.ts", "ok", []).isError).toBeFalsy();
+		expect(codeReviewResponse("UNCERTAIN", "a.ts", "unsure", []).isError).toBeFalsy();
 	});
 });
 

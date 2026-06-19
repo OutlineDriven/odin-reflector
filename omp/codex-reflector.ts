@@ -8,17 +8,21 @@
  * directly via `codex exec`.
  *
  * Coverage (oh-my-pi native tool names):
- *   - code review:    write / edit / ast_edit + Fast-Apply MCP (success)  -> tool_result content
+ *   - side-effect review: write / edit / ast_edit / bash + Fast-Apply MCP (success)
+ *                      -> tool_result content; FAIL -> isError (block)
  *   - thinking:       sequential / shannon MCP                            -> tool_result content
- *   - bash diagnostic:bash (error)                                        -> sendMessage
- *   - fast-apply diag:Fast-Apply MCP (error, Morph payload)              -> sendMessage
+ *   - bash diagnostic:bash (error; already failed tool call)              -> sendMessage
+ *   - fast-apply diag:Fast-Apply MCP (error, Morph payload; already failed tool call)
+ *                      -> sendMessage
  *   - stop review:    session_stop (PASS/UNCERTAIN, fresh review)         -> settle (UI notice only)
  *   - FAIL enforce:   session_stop (FAIL, fresh review)                   -> continue (block decision)
  *   - precompaction:  session_before_compact                             -> sendMessage
  *
- * Delivery-channel rule: oh-my-pi applies a tool_result `content` override only
- * on the SUCCESS path; on a tool error it emits isError + rethrows the original
- * error, so error-path feedback must go via `pi.sendMessage`.
+ * Delivery-channel rule: oh-my-pi applies a tool_result `content`/`isError`
+ * override only on the SUCCESS path; a FAIL side-effect review sets isError:true
+ * there, and the extensions tool wrapper rethrows that success result as a failed
+ * tool call. On a genuine tool error, the tool call is already failed; keep the
+ * original error and send supplemental diagnostics via `pi.sendMessage`.
  *
  * Env vars: CODEX_REFLECTOR_ENABLED ("0" disables), CODEX_REFLECTOR_MODEL
  * (override all model selections), CODEX_REFLECTOR_DEBUG ("1" for logger diag).
@@ -57,7 +61,7 @@ export function testSetHandlerBudgetMs(ms: number): void {
 }
 
 type Effort = "low" | "medium" | "high" | "xhigh";
-type Category = "code_change" | "thinking" | "bash_failure" | "code_change_failure";
+type Category = "code_change" | "thinking" | "bash_success" | "bash_failure" | "code_change_failure";
 export type Verdict = "PASS" | "FAIL" | "UNCERTAIN";
 
 interface Preset {
@@ -78,6 +82,7 @@ const CODE_REVIEW_COMPLEX: Preset = { model: DEFAULT_MODEL, effort: "xhigh" };
 const CODE_REVIEW_TINY: Preset = { model: DEFAULT_MODEL, effort: "low" };
 const THINKING: Preset = { model: DEFAULT_MODEL, effort: "medium" };
 const BASH_FAILURE: Preset = { model: DEFAULT_MODEL, effort: "low" };
+const BASH_REVIEW: Preset = { model: DEFAULT_MODEL, effort: "low" };
 const STOP_REVIEW: Preset = { model: DEFAULT_MODEL, effort: "medium" };
 const PRECOMPACT: Preset = { model: DEFAULT_MODEL, effort: "medium" };
 const SUMMARIZE: Preset = { model: FAST_MODEL, effort: "high" };
@@ -309,6 +314,7 @@ export function classify(
 			return { category: "code_change_failure", ...BASH_FAILURE };
 		return null;
 	}
+	if (toolName === "bash") return { category: "bash_success", ...BASH_REVIEW };
 	const isMcp = toolName.startsWith("mcp__");
 	if (CODE_CHANGE_TOOLS.has(toolName) || (isMcp && MCP_EDIT_MARKERS.some((m) => toolName.includes(m))))
 		return { category: "code_change", ...CODE_REVIEW };
@@ -629,6 +635,34 @@ Be concise and actionable.` + COMPACT_ANALYSIS
 	);
 }
 
+async function buildBashSuccessPrompt(
+	command: string,
+	output: string,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	const compactedOutput = await matryoshkaCompact(redact(output), 20_000, cwd, 3, signal);
+	const data = sandboxContent(
+		"successful-command",
+		`Command: ${redact(command)}\nOutput:\n${compactedOutput}`,
+	);
+	return (
+		`A bash command completed successfully. Review the command and its output for material problems.
+
+${data}
+
+Evaluate:
+1. SAFETY: Does the command or output expose secrets, credentials, or sensitive paths?
+2. CORRECTNESS: Is the output consistent with the command, or does it indicate a silent/partial failure?
+3. SIDE EFFECTS: Did the command mutate state in an unsafe, unintended, or destructive way?
+4. OUTPUT QUALITY: Is the output truncated, garbled, or missing information needed to verify success?
+
+Your first line MUST be exactly PASS or FAIL.
+FAIL only if: a material command-side-effect or output problem is confirmed.
+PASS if: the command is safe and the output is acceptable.` + COMPACT_VERDICT
+	);
+}
+
 function buildCodeChangeFailurePrompt(
 	toolName: string,
 	filePath: string,
@@ -854,19 +888,24 @@ async function compactSnippet(rawSnippet: string, cwd: string, signal?: AbortSig
 // Review response builder
 // ---------------------------------------------------------------------------
 
-/** Build the tool_result content override for a code review (all verdicts). */
+/** Build the tool_result result for a side-effect review. PASS/UNCERTAIN are
+ * advisory (content override only). A FAIL sets isError:true so the extensions
+ * tool wrapper (ExtensionToolWrapper) rethrows the succeeded tool call as a failed
+ * call — blocking it (fail-open: only a definitive FAIL blocks). */
 export function codeReviewResponse(
 	verdict: Verdict,
 	filePath: string,
 	out: string,
 	baseContent: ToolResultEvent["content"],
 ): ToolResultEventResult {
-	return {
+	const result: ToolResultEventResult = {
 		content: [
 			...baseContent,
 			{ type: "text" as const, text: `Codex Review ${VERDICT_PREFIX[verdict]} [${filePath}]:\n${out}` },
 		],
 	};
+	if (verdict === "FAIL") result.isError = true;
+	return result;
 }
 
 /** Map a holistic Stop-review verdict to its settle decision: only a definitive
@@ -916,6 +955,17 @@ export default function codexReflector(pi: ExtensionAPI): void {
 				const out = await compactOutput(raw, cwd);
 				notifyUI(ctx, `Codex ${verdict} [${filePath}]`, verdict === "FAIL" ? "warning" : "info");
 				return codeReviewResponse(verdict, filePath, out, event.content);
+			}
+
+			if (routed.category === "bash_success") {
+				const command = typeof event.input.command === "string" ? event.input.command : "unknown";
+				const prompt = await buildBashSuccessPrompt(command, textOf(event.content), cwd, signal);
+				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model, signal);
+				if (!raw) return undefined;
+				const verdict = parseVerdict(raw);
+				const out = await compactOutput(raw, cwd);
+				notifyUI(ctx, `Codex ${verdict} [bash]`, verdict === "FAIL" ? "warning" : "info");
+				return codeReviewResponse(verdict, "bash", out, event.content);
 			}
 
 			if (routed.category === "thinking") {
