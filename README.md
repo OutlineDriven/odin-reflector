@@ -105,9 +105,11 @@ Cursor compatibility notes:
 
 ## oh-my-pi (omp)
 
-A native TypeScript port of this reflector ships at `omp/codex-reflector.ts` — no Python runtime; it calls `codex exec` directly. It registers oh-my-pi hooks that mirror the Claude plugin: code review on `write`/`edit`/`ast_edit` and Fast-Apply MCP edits, root-cause diagnostics on failed `bash` and Fast-Apply calls, metacognitive reflection on thinking-MCP steps (`sequential`, `shannon`), and a pre-compaction session summary.
+A native TypeScript port of this reflector ships at `omp/codex-reflector.ts` — no Python runtime; it calls `codex exec` directly. It registers oh-my-pi extension handlers that mirror the Claude plugin: code review on `write`/`edit`/`ast_edit` and Fast-Apply MCP edits, root-cause diagnostics on failed `bash` and Fast-Apply calls, metacognitive reflection on thinking-MCP steps (`sequential`, `shannon`), and a pre-compaction session summary.
 
-### Install the omp CLI
+### Installation Guide
+
+#### 1. Install the omp CLI
 
 Skip if you already have it ([more options](https://omp.sh)):
 
@@ -116,43 +118,21 @@ curl -fsSL https://omp.sh/install | sh       # macOS / Linux
 bun install -g @oh-my-pi/pi-coding-agent      # any platform, bun >= 1.3.14
 ```
 
-The module is an oh-my-pi **extension** — a default-export factory that registers handlers via `pi.on`. Its Stop gate uses the `session_stop` event, which the extension surface guarantees, so [installing it as an extension](#install-as-an-extension) is the canonical path.
+#### 2. Install the reflector from GitHub (recommended)
 
-### Install as a hook
-
-oh-my-pi auto-discovers hooks in `.omp/hooks/` (project) and `~/.omp/hooks/` (user). The tool-review and pre-compaction handlers run here, but the `session_stop` Stop gate needs the extension surface — prefer [Install as an extension](#install-as-an-extension) for full enforcement. Symlink the module into one of those, or load it for a single run:
+Install this repository directly as an oh-my-pi plugin:
 
 ```sh
-mkdir -p ~/.omp/hooks
-ln -s "$(pwd)/omp/codex-reflector.ts" ~/.omp/hooks/codex-reflector.ts
-
-# or, one-off (no install):
-omp --hook "$(pwd)/omp/codex-reflector.ts" -p "…"
+omp plugin install https://github.com/OutlineDriven/odin-reflector
 ```
 
-### Install as an extension
+The repository's `package.json` declares `omp.extensions: ["./omp/codex-reflector.ts"]`, so omp installs the GitHub package and loads the native extension from that manifest. This is the canonical install path for normal use: no local clone, symlink, or config-file edit is required.
 
-Register the module through the extension surface — pick one:
+For a named omp profile, run the same command with that profile selected:
 
-- **Manifest** — the checked-in `package.json` declares the hook in its `omp.extensions` field (`./omp/codex-reflector.ts`). Point omp at the repo directory and it resolves the manifest:
-
-  ```sh
-  omp -e /path/to/odin-reflector
-  ```
-
-- **Auto-discovery** — symlink the module into an extension directory, project-local (`<repo>/.omp/extensions/`) or user-global (`~/.omp/agent/extensions/`):
-
-  ```sh
-  mkdir -p ~/.omp/agent/extensions
-  ln -s "$(pwd)/omp/codex-reflector.ts" ~/.omp/agent/extensions/codex-reflector.ts
-  ```
-
-- **Config** — add the absolute path to the `extensions` array in `~/.omp/agent/config.yml`:
-
-  ```yaml
-  extensions:
-    - /path/to/odin-reflector/omp/codex-reflector.ts
-  ```
+```sh
+omp --profile <profile> plugin install https://github.com/OutlineDriven/odin-reflector
+```
 
 ### Behavior
 
