@@ -118,43 +118,20 @@ curl -fsSL https://omp.sh/install | sh       # macOS / Linux
 bun install -g @oh-my-pi/pi-coding-agent      # any platform, bun >= 1.3.14
 ```
 
-#### 2. Install the reflector as an extension (recommended)
+#### 2. Install the reflector from GitHub (recommended)
 
-The module is an oh-my-pi **extension** — a default-export factory that registers handlers via `pi.on`. Its Stop gate uses the extension-only `session_stop` event, so extension loading is the canonical path. Choose one:
-
-- **Manifest from this checkout** — the checked-in `package.json` declares the extension in `omp.extensions` (`./omp/codex-reflector.ts`). Point omp at the repo directory and it resolves the manifest:
-
-  ```sh
-  omp -e /path/to/odin-reflector
-  ```
-
-- **Auto-discovery** — symlink the module into an extension directory, project-local (`<repo>/.omp/extensions/`) or user-global (`~/.omp/agent/extensions/`):
-
-  ```sh
-  mkdir -p ~/.omp/agent/extensions
-  ln -s "$(pwd)/omp/codex-reflector.ts" ~/.omp/agent/extensions/codex-reflector.ts
-  ```
-
-- **Config** — add the absolute path to the `extensions` array in `~/.omp/agent/config.yml`:
-
-  ```yaml
-  extensions:
-    - /path/to/odin-reflector/omp/codex-reflector.ts
-  ```
-
-For a named omp profile, use that profile's user base (`~/.omp/profiles/<profile>/agent/...`) instead of `~/.omp/agent/...`.
-
-#### Optional: hook-directory install
-
-oh-my-pi can also discover JS/TS hook factories from legacy hook directories. Current omp loads those files through the same extension module pipeline, so `codex-reflector.ts` still registers its extension handlers; this path is equivalent but redundant for this reflector. If you use hook directories, use `hooks/pre/` or `hooks/post/` under the project `.omp/` directory or the user `~/.omp/agent/` directory — never a flat `~/.omp/hooks/`.
+Install this repository directly as an oh-my-pi plugin:
 
 ```sh
-mkdir -p ~/.omp/agent/hooks/post
-ln -s "$(pwd)/omp/codex-reflector.ts" ~/.omp/agent/hooks/post/codex-reflector.ts
+omp plugin install https://github.com/OutlineDriven/odin-reflector
+```
 
-# project-local equivalent:
-mkdir -p .omp/hooks/post
-ln -s "$(pwd)/omp/codex-reflector.ts" .omp/hooks/post/codex-reflector.ts
+The repository's `package.json` declares `omp.extensions: ["./omp/codex-reflector.ts"]`, so omp installs the GitHub package and loads the native extension from that manifest. This is the canonical install path for normal use: no local clone, symlink, or config-file edit is required.
+
+For a named omp profile, run the same command with that profile selected:
+
+```sh
+omp --profile <profile> plugin install https://github.com/OutlineDriven/odin-reflector
 ```
 
 ### Behavior
