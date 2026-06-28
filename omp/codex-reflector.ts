@@ -1042,6 +1042,7 @@ export default function codexReflector(pi: ExtensionAPI): void {
 	pi.on("session_stop", async (event, ctx) => {
 		let deadline: ReturnType<typeof handlerDeadline> | undefined;
 		try {
+			if (getProp(event, "stop_hook_active") === true) return undefined;
 			const cwd = ctx.cwd || process.cwd();
 			const transcript = renderTranscript(toArray(getProp(event, "messages")));
 			if (!transcript) return undefined;
