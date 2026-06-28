@@ -295,6 +295,54 @@ describe("factory", () => {
 			}
 		}, 15_000);
 	}
+
+	test("session_stop with stop_hook_active=true settles without re-reviewing", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const invokeLog = join(binDir, "invoked.log");
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh
+echo $$ >> ${JSON.stringify(invokeLog)}
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] && printf '%s\n' ${JSON.stringify("FAIL: missing guard")} > "$out"
+exit 0
+`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		process.env.PATH = `${binDir}:${prevPath}`;
+		try {
+			const { pi, handlers, sendMessageCalls } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("session_stop");
+			expect(handler).toBeDefined();
+			const result = await handler?.(
+				{
+					type: "session_stop",
+					messages: [
+						{ role: "user", content: "hi" },
+						{ role: "assistant", content: "did work" },
+					],
+					turn_id: 1,
+					session_id: "s",
+					stop_hook_active: true,
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+			expect(existsSync(invokeLog)).toBe(false);
+			expect(sendMessageCalls).toHaveLength(0);
+		} finally {
+			process.env.PATH = prevPath;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
 	// Per-tool code-review is advisory: every verdict (PASS/UNCERTAIN/FAIL) rides along as
 	// appended content and NONE sets isError, so a succeeded edit/command is never blocked.
 	// Enforcement lives in the holistic session_stop review (see STOP_VERDICTS), not here.

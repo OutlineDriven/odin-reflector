@@ -138,7 +138,7 @@ omp --profile <profile> plugin install https://github.com/OutlineDriven/odin-ref
 
 Reads the same [environment variables](#environment-variables) as the Claude plugin. Run the unit tests with `bun test omp/codex-reflector.test.ts`.
 
-**Behavioral delta from the Claude plugin:** both ports are stateless. Code reviews inject their verdict and full opinion inline for every verdict; the Stop gate is a fresh holistic review on the native `session_stop` event (main-session-only, awaited before the turn settles). Only a definitive FAIL blocks — it returns `{ decision: "block", reason }` so the agent keeps working with that context; PASS and UNCERTAIN settle (fail-open — never block on uncertainty). It re-runs on each blocked settle attempt, bounded by oh-my-pi's built-in 8-continuation cap.
+**Behavioral delta from the Claude plugin:** both ports are stateless. Code reviews inject their verdict and full opinion inline for every verdict; the Stop gate is a fresh holistic review on the native `session_stop` event (main-session-only, awaited before the turn settles). Only a definitive FAIL blocks; PASS and UNCERTAIN settle (fail-open — never block on uncertainty). It runs once per stop chain: a FAIL returns `{ decision: "block", reason }` so the agent keeps working with that context, then the harness `stop_hook_active` flag settles the re-stop (matching the Python plugin); the native 8-continuation cap is the backstop.
 
 ### Hook events
 
@@ -147,7 +147,7 @@ Reads the same [environment variables](#environment-variables) as the Claude plu
 | `tool_result` | `write` / `edit` / `ast_edit`, Fast-Apply MCP edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
 | `tool_result` | `sequential` / `shannon` thinking-MCP steps | sync | Metacognitive reflection (advisory, no verdict) |
 | `tool_result` (`isError`) | failed `bash`, failed Fast-Apply edit | async | Root-cause diagnosis for failed calls |
-| `session_stop` | main agent about to settle | sync | Fresh holistic Stop review every stop; only FAIL blocks (PASS/UNCERTAIN settle); native 8-continuation cap |
+| `session_stop` | main agent about to settle | sync | Fresh holistic Stop review once per stop chain (`stop_hook_active` guard); only FAIL blocks (PASS/UNCERTAIN settle); native 8-continuation cap backstop |
 | `session_before_compact` | context compaction | sync | Summarizes critical session context |
 
 ---
@@ -170,7 +170,7 @@ Both surfaces run the same Codex reflection loop and keep no FAIL state — revi
 
 After Write/Edit tool calls, Codex reviews the change in a read-only sandbox. The verdict (PASS/FAIL/UNCERTAIN) and full opinion are injected inline so the agent sees them on the next turn — returned for every verdict, not just failures. FAIL/UNCERTAIN additionally feed the verdict back as agent context for self-correction.
 
-The reflector keeps no FAIL state. Instead the Stop hook runs a fresh holistic review of the session, and only a definitive FAIL blocks (PASS and UNCERTAIN settle — never block on uncertainty): in the Python plugin it runs once per stop chain — a FAIL blocks via exit `2`, then the `stop_hook_active` guard lets a re-stop settle; in omp it runs on every stop (a FAIL returns `{ decision: "block", reason }`), bounded by the native 8-continuation cap.
+The reflector keeps no FAIL state. Instead the Stop hook runs a fresh holistic review of the session, and only a definitive FAIL blocks (PASS and UNCERTAIN settle — never block on uncertainty): in the Python plugin it runs once per stop chain — a FAIL blocks via exit `2`, then the `stop_hook_active` guard lets a re-stop settle; in omp it likewise runs once per stop chain — a FAIL returns `{ decision: "block", reason }`, then the `stop_hook_active` guard settles the re-stop — with the native 8-continuation cap as backstop.
 
 ### Thinking Reflection (sync)
 
@@ -200,7 +200,7 @@ Self-test the parser with `python3 scripts/codex-reflector.py --test-parse` (plu
 
 - **Fail-open**: any internal error approves silently and never blocks the agent — the Python plugin exits `0`; the omp hook returns without a block.
 - **Read-only sandbox**: Codex runs with `--sandbox read-only` — it cannot modify files (both surfaces).
-- **Loop prevention**: the plugin's Stop hook checks the `stop_hook_active` flag; the omp port relies on the native `session_stop` event and oh-my-pi's built-in 8-continuation cap.
+- **Loop prevention**: both surfaces check the `stop_hook_active` flag to run the Stop review once per stop chain, with oh-my-pi's built-in 8-continuation cap as the omp backstop.
 
 ## License
 
