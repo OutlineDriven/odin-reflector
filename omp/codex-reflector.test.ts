@@ -151,27 +151,41 @@ describe("changeSizeHeuristics", () => {
 
 describe("gateModelEffort", () => {
 	test("tiny non-risky snippet -> low", () => {
-		expect(gateModelEffort("code_change", "src/util.ts", "const x = 1;").effort).toBe("low");
+		expect(gateModelEffort("code_change", "src/util.ts", "const x = 1;")).toEqual({
+			model: "gpt-5.6-luna",
+			effort: "low",
+		});
 	});
 	test("security-sensitive path -> hard (high)", () => {
-		expect(gateModelEffort("code_change", ".env.local", "X".repeat(300)).effort).toBe("high");
+		expect(gateModelEffort("code_change", ".env.local", "X".repeat(300))).toEqual({
+			model: "gpt-5.6-sol",
+			effort: "high",
+		});
 	});
 	test("large snippet -> hard (high)", () => {
-		expect(gateModelEffort("code_change", "src/util.ts", "X".repeat(6000)).effort).toBe("high");
+		expect(gateModelEffort("code_change", "src/util.ts", "X".repeat(6000))).toEqual({
+			model: "gpt-5.6-sol",
+			effort: "high",
+		});
 	});
 	test("multiple risk signals -> complex (xhigh)", () => {
 		// security-sensitive path (1 file hint) + >5000 chars (1 change hint) -> complex
-		expect(gateModelEffort("code_change", ".env.local", "X".repeat(6000)).effort).toBe("xhigh");
+		expect(gateModelEffort("code_change", ".env.local", "X".repeat(6000))).toEqual({
+			model: "gpt-5.6-sol",
+			effort: "xhigh",
+		});
 	});
 	test("non code_change category -> base preset", () => {
-		expect(gateModelEffort("thinking", "whatever", "X".repeat(6000)).effort).toBe("medium");
+		expect(gateModelEffort("thinking", "whatever", "X".repeat(6000))).toEqual({
+			model: "gpt-5.6-terra",
+			effort: "medium",
+		});
 	});
 	test("medium-size non-risky snippet -> faster model at high effort", () => {
-		const mid = gateModelEffort("code_change", "src/util.ts", "X".repeat(2000));
-		const hard = gateModelEffort("code_change", "src/util.ts", "X".repeat(6000));
-		expect(mid.effort).toBe("high");
-		// distinct (faster) model than the large-content hard preset, without hard-coding names
-		expect(mid.model).not.toBe(hard.model);
+		expect(gateModelEffort("code_change", "src/util.ts", "X".repeat(2000))).toEqual({
+			model: "gpt-5.6-luna",
+			effort: "high",
+		});
 	});
 });
 
@@ -296,6 +310,113 @@ describe("factory", () => {
 		}, 15_000);
 	}
 
+	test("session_stop invokes codex with the frontier stop preset", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const argsLog = join(binDir, "args.log");
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh
+ARGS_LOG=${JSON.stringify(argsLog)}
+printf '%s\\n' "$*" >> "$ARGS_LOG"
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] && printf 'PASS\\n' > "$out"
+exit 0
+`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
+		process.env.PATH = `${binDir}:${prevPath}`;
+		delete process.env.CODEX_REFLECTOR_MODEL;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("session_stop");
+			expect(handler).toBeDefined();
+			const result = await handler?.(
+				{
+					type: "session_stop",
+					messages: [
+						{ role: "user", content: "hi" },
+						{ role: "assistant", content: "did work" },
+					],
+					turn_id: 1,
+					session_id: "s",
+					stop_hook_active: false,
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
+			expect(argsLines).toHaveLength(1);
+			expect(argsLines[0]).toContain("-m gpt-5.6-sol");
+			expect(argsLines[0]).toContain("model_reasoning_effort=medium");
+		} finally {
+			process.env.PATH = prevPath;
+			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
+			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	test("session_before_compact invokes codex with the frontier precompact preset", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const argsLog = join(binDir, "args.log");
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh
+ARGS_LOG=${JSON.stringify(argsLog)}
+printf '%s\\n' "$*" >> "$ARGS_LOG"
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] && printf 'reflect\\n' > "$out"
+exit 0
+`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
+		process.env.PATH = `${binDir}:${prevPath}`;
+		delete process.env.CODEX_REFLECTOR_MODEL;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("session_before_compact");
+			expect(handler).toBeDefined();
+			await handler?.(
+				{
+					type: "session_before_compact",
+					preparation: {
+						messagesToSummarize: [{ role: "user", content: "work to reflect on" }],
+					},
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
+			// One main precompact invoke; matryoshka may not fire for a short transcript.
+			expect(argsLines.length).toBeGreaterThanOrEqual(1);
+			const precompactLine = argsLines[argsLines.length - 1] ?? "";
+			expect(precompactLine).toContain("-m gpt-5.6-sol");
+			expect(precompactLine).toContain("model_reasoning_effort=low");
+		} finally {
+			process.env.PATH = prevPath;
+			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
+			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
 	test("session_stop with stop_hook_active=true settles without re-reviewing", async () => {
 		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 		const invokeLog = join(binDir, "invoked.log");
@@ -392,6 +513,60 @@ exit 0
 			}
 		}, 15_000);
 	}
+
+	test("CODEX_REFLECTOR_MODEL override swaps only the model, never the effort", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const argsLog = join(binDir, "args.log");
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh
+ARGS_LOG=${JSON.stringify(argsLog)}
+printf '%s\\n' "$*" >> "$ARGS_LOG"
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] && printf 'PASS\\n' > "$out"
+exit 0
+`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
+		process.env.PATH = `${binDir}:${prevPath}`;
+		process.env.CODEX_REFLECTOR_MODEL = "gpt-5.3-codex-spark";
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("tool_result");
+			expect(handler).toBeDefined();
+			const event = {
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: "id",
+				input: { path: "src/util.ts", content: "const x = 1;" },
+				content: [],
+				isError: false,
+			} as unknown as Parameters<NonNullable<typeof handler>>[0];
+			const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
+				NonNullable<typeof handler>
+			>[1];
+			const result = await handler?.(event, ctx);
+			expect(result).toBeDefined();
+			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
+			expect(argsLines).toHaveLength(1);
+			expect(argsLines[0]).toContain("-m gpt-5.3-codex-spark");
+			expect(argsLines[0]).toContain("model_reasoning_effort=low");
+		} finally {
+			process.env.PATH = prevPath;
+			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
+			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
 	// Successful bash command review: same PASS/UNCERTAIN/FAIL contract as code_change.
 	const BASH_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string }> = [
 		{ name: "PASS", out: "PASS" },
