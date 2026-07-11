@@ -422,12 +422,13 @@ def _gate_model_effort(
     change_hints = _change_size_heuristics(content, old, new)
 
     # Tiny + no risk signals → lightweight. Cover Write `content` and Edit
-    # old/new alike (OMP size proxy). Empty payload / pure-empty new alone is
-    # not tiny — deletions and missing content stay on the default path.
+    # replacements alike. Pure deletions (`new_string` empty) and empty
+    # payloads stay on the default path — require a non-empty replacement
+    # before treating an Edit as tiny.
     has_content = bool(content)
-    has_edit = bool(old or new)
+    has_replacement = bool(old) and bool(new)
     tiny = (has_content and len(content) < 200) or (
-        has_edit and len(old) < 200 and len(new) < 200
+        has_replacement and len(old) < 200 and len(new) < 200
     )
     if tiny and not file_hints:
         return _ME_CODE_REVIEW_TINY
@@ -1564,6 +1565,20 @@ def run_self_test() -> None:
                 {
                     "file_path": "src/util.ts",
                     "old_string": "x" * 500,
+                    "new_string": "",
+                },
+            ),
+            (base_m, base_e),
+        ),
+        (
+            "small pure deletion stays base terra/medium",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {
+                    "file_path": "src/util.ts",
+                    "old_string": "x" * 100,
                     "new_string": "",
                 },
             ),
