@@ -421,8 +421,15 @@ def _gate_model_effort(
     file_hints = _file_heuristics(file_path)
     change_hints = _change_size_heuristics(content, old, new)
 
-    # Tiny + no risk signals → lightweight
-    if old and new and len(new) < 200 and len(old) < 200 and not file_hints:
+    # Tiny + no risk signals → lightweight. Cover Write `content` and Edit
+    # old/new alike (OMP size proxy). Empty payload / pure-empty new alone is
+    # not tiny — deletions and missing content stay on the default path.
+    has_content = bool(content)
+    has_edit = bool(old or new)
+    tiny = (has_content and len(content) < 200) or (
+        has_edit and len(old) < 200 and len(new) < 200
+    )
+    if tiny and not file_hints:
         return _ME_CODE_REVIEW_TINY
 
     # Complex: multiple risk signals
@@ -1512,6 +1519,211 @@ def run_self_test() -> None:
         all_total += 1
         if ok:
             all_passed += 1
+
+    # --- Model routing (exact model, effort pairs) ---
+    print("\n=== Model Routing ===")
+    base_m, base_e = _ME_CODE_REVIEW
+    routing_cases = [
+        (
+            "Write tiny content -> luna/low",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {"file_path": "src/util.ts", "content": "const x = 1;"},
+            ),
+            (FAST_MODEL, "low"),
+        ),
+        (
+            "Edit tiny old/new -> luna/low",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {
+                    "file_path": "src/util.ts",
+                    "old_string": "a",
+                    "new_string": "b",
+                },
+            ),
+            (FAST_MODEL, "low"),
+        ),
+        (
+            "empty payload stays base terra/medium",
+            _gate_model_effort(
+                "code_change", base_m, base_e, {"file_path": "src/util.ts"}
+            ),
+            (base_m, base_e),
+        ),
+        (
+            "deletion (empty new, large old) stays base",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {
+                    "file_path": "src/util.ts",
+                    "old_string": "x" * 500,
+                    "new_string": "",
+                },
+            ),
+            (base_m, base_e),
+        ),
+        (
+            "security path -> sol/high",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {"file_path": ".env.local", "content": "X" * 300},
+            ),
+            (FRONTIER_MODEL, "high"),
+        ),
+        (
+            "large snippet -> sol/high",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {"file_path": "src/util.ts", "content": "X" * 6000},
+            ),
+            (FRONTIER_MODEL, "high"),
+        ),
+        (
+            "multiple risk signals -> sol/xhigh",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {"file_path": ".env.local", "content": "X" * 6000},
+            ),
+            (FRONTIER_MODEL, "xhigh"),
+        ),
+        (
+            "medium non-risky -> luna/high",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {"file_path": "src/util.ts", "content": "X" * 2000},
+            ),
+            (FAST_MODEL, "high"),
+        ),
+        (
+            "non code_change keeps base",
+            _gate_model_effort("thinking", base_m, base_e, {"content": "X" * 6000}),
+            (base_m, base_e),
+        ),
+        (
+            "Stop preset is frontier@medium",
+            (_ME_STOP_REVIEW.model, _ME_STOP_REVIEW.effort),
+            (FRONTIER_MODEL, "medium"),
+        ),
+        (
+            "Summarize preset is fast@high",
+            (_ME_SUMMARIZE.model, _ME_SUMMARIZE.effort),
+            (FAST_MODEL, "high"),
+        ),
+        (
+            "Plan review is frontier@xhigh",
+            (_ME_PLAN_REVIEW.model, _ME_PLAN_REVIEW.effort),
+            (FRONTIER_MODEL, "xhigh"),
+        ),
+    ]
+    for desc, got, expected in routing_cases:
+        # _gate_model_effort returns ModelEffort or (model, effort); both index.
+        got_pair = (got[0], got[1])
+        ok = got_pair == expected
+        status = "OK" if ok else "FAIL"
+        print(f"  {status}: {desc}: got={got_pair!r} expected={expected!r}")
+        all_total += 1
+        if ok:
+            all_passed += 1
+
+    # --- Argv capture: Stop frontier@medium + env override preserves effort ---
+    print("\n=== Argv Capture ===")
+    import shutil
+    import stat
+    import tempfile as _tempfile
+
+    bin_dir = _tempfile.mkdtemp(prefix="codex-ref-fakebin-")
+    args_log = Path(bin_dir) / "args.log"
+    fake_codex = Path(bin_dir) / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$*" >> "$(dirname "$0")/args.log"\n'
+        'out=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        '    -o) out="$2"; shift 2 ;;\n'
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        '[ -n "$out" ] && printf \'%s\\n\' PASS > "$out"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IEXEC)
+    prev_path = os.environ.get("PATH", "")
+    prev_model = os.environ.get("CODEX_REFLECTOR_MODEL")
+    os.environ["PATH"] = f"{bin_dir}{os.pathsep}{prev_path}"
+    try:
+        # Stop frontier@medium — clear ambient override so preset is visible
+        if "CODEX_REFLECTOR_MODEL" in os.environ:
+            del os.environ["CODEX_REFLECTOR_MODEL"]
+        args_log.write_text("", encoding="utf-8")
+        invoke_codex(
+            "stop review probe",
+            cwd=".",
+            effort=_ME_STOP_REVIEW.effort,
+            model=_ME_STOP_REVIEW.model,
+        )
+        stop_line = args_log.read_text(encoding="utf-8").strip().splitlines()
+        stop_ok = (
+            len(stop_line) == 1
+            and f"-m {_ME_STOP_REVIEW.model}" in stop_line[0]
+            and f"model_reasoning_effort={_ME_STOP_REVIEW.effort}" in stop_line[0]
+        )
+        status = "OK" if stop_ok else "FAIL"
+        print(
+            f"  {status}: Stop argv frontier@medium: "
+            f"{stop_line[0] if stop_line else '<empty>'!r}"
+        )
+        all_total += 1
+        if stop_ok:
+            all_passed += 1
+
+        # Override swaps model only; effort from route is preserved
+        os.environ["CODEX_REFLECTOR_MODEL"] = "gpt-5.3-codex-spark"
+        args_log.write_text("", encoding="utf-8")
+        invoke_codex(
+            "override probe",
+            cwd=".",
+            effort=_ME_CODE_REVIEW_TINY.effort,
+            model=_ME_CODE_REVIEW_TINY.model,
+        )
+        ov_line = args_log.read_text(encoding="utf-8").strip().splitlines()
+        ov_ok = (
+            len(ov_line) == 1
+            and "-m gpt-5.3-codex-spark" in ov_line[0]
+            and f"model_reasoning_effort={_ME_CODE_REVIEW_TINY.effort}" in ov_line[0]
+            and f"-m {_ME_CODE_REVIEW_TINY.model}" not in ov_line[0]
+        )
+        status = "OK" if ov_ok else "FAIL"
+        print(
+            f"  {status}: CODEX_REFLECTOR_MODEL preserves effort: "
+            f"{ov_line[0] if ov_line else '<empty>'!r}"
+        )
+        all_total += 1
+        if ov_ok:
+            all_passed += 1
+    finally:
+        os.environ["PATH"] = prev_path
+        if prev_model is None:
+            os.environ.pop("CODEX_REFLECTOR_MODEL", None)
+        else:
+            os.environ["CODEX_REFLECTOR_MODEL"] = prev_model
+        shutil.rmtree(bin_dir, ignore_errors=True)
 
     print(f"\n{all_passed}/{all_total} passed")
     sys.exit(0 if all_passed == all_total else 1)
