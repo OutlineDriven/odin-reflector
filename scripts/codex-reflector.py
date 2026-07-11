@@ -33,9 +33,9 @@ MAX_COMPACT_CHARS = (
 _SYNTHETIC_PREFIX = (
     "synthetic::"  # Readability convention for non-filesystem path identifiers
 )
-DEFAULT_MODEL = "gpt-5.5"  # 1M context window
-LIGHTNING_FAST_MODEL = "gpt-5.3-codex-spark"  # 128k context window
-FAST_MODEL = "gpt-5.4-mini"  # 1M context window
+DEFAULT_MODEL = "gpt-5.6-terra"  # balanced everyday reviewer
+FRONTIER_MODEL = "gpt-5.6-sol"  # frontier: risk-escalated reviews + Stop gate
+FAST_MODEL = "gpt-5.6-luna"  # fast/affordable: summaries, mid-gate, tiny reviews
 
 # ---------------------------------------------------------------------------
 # Model/effort presets — every (model, effort) pair lives here
@@ -44,13 +44,13 @@ FAST_MODEL = "gpt-5.4-mini"  # 1M context window
 ModelEffort = namedtuple("ModelEffort", ["model", "effort"])
 
 _ME_CODE_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")  # base: generic changes
-_ME_CODE_REVIEW_HARD = ModelEffort(DEFAULT_MODEL, "high")  # risk signals
-_ME_CODE_REVIEW_COMPLEX = ModelEffort(DEFAULT_MODEL, "xhigh")
-_ME_CODE_REVIEW_TINY = ModelEffort(DEFAULT_MODEL, "low")  # trivial → low
-_ME_PLAN_REVIEW = ModelEffort(DEFAULT_MODEL, "xhigh")
+_ME_CODE_REVIEW_HARD = ModelEffort(FRONTIER_MODEL, "high")  # risk signals
+_ME_CODE_REVIEW_COMPLEX = ModelEffort(FRONTIER_MODEL, "xhigh")
+_ME_CODE_REVIEW_TINY = ModelEffort(FAST_MODEL, "low")  # trivial -> fast model
+_ME_PLAN_REVIEW = ModelEffort(FRONTIER_MODEL, "xhigh")
 _ME_THINKING = ModelEffort(DEFAULT_MODEL, "medium")
 _ME_BASH_FAILURE = ModelEffort(DEFAULT_MODEL, "low")
-_ME_STOP_REVIEW = ModelEffort(DEFAULT_MODEL, "medium")
+_ME_STOP_REVIEW = ModelEffort(FRONTIER_MODEL, "medium")
 _ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "medium")  # compaction
 _ME_SUMMARIZE = ModelEffort(FAST_MODEL, "high")
 _ME_SUBAGENT_REVIEW = ModelEffort(FAST_MODEL, "high")
@@ -433,7 +433,7 @@ def _gate_model_effort(
     if file_hints or change_hints or size > 5000:
         return _ME_CODE_REVIEW_HARD
 
-    # Medium-sized, no signals → mini with bumped effort
+    # Medium-sized, no signals → fast model with bumped effort
     if size > 1000:
         return ModelEffort(FAST_MODEL, "high")
 
@@ -593,9 +593,6 @@ def invoke_codex(prompt: str, cwd: str, effort: str = "medium", model: str = "")
     """Call `codex exec` in read-only sandbox. Returns raw output or ''."""
     # Env var override takes precedence, then passed model, then DEFAULT_MODEL
     model = os.environ.get("CODEX_REFLECTOR_MODEL", model or DEFAULT_MODEL)
-    # Lightning-fast model needs at least high effort
-    if model == LIGHTNING_FAST_MODEL and effort in ("low", "medium"):
-        effort = "high"
 
     fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="codex-ref-")
     os.close(fd)

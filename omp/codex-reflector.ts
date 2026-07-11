@@ -43,9 +43,9 @@ import type { ExtensionAPI, ToolResultEvent, ToolResultEventResult } from "@oh-m
 
 const DEBUG = process.env.CODEX_REFLECTOR_DEBUG === "1";
 
-const DEFAULT_MODEL = "gpt-5.5"; // 1M context window
-const LIGHTNING_FAST_MODEL = "gpt-5.3-codex-spark"; // 128k context window
-const FAST_MODEL = "gpt-5.4-mini"; // 1M context window
+const DEFAULT_MODEL = "gpt-5.6-terra"; // balanced everyday reviewer
+const FRONTIER_MODEL = "gpt-5.6-sol"; // frontier: risk-escalated reviews + Stop gate
+const FAST_MODEL = "gpt-5.6-luna"; // fast/affordable: summaries, mid-gate, tiny reviews
 
 const MAX_COMPACT_CHARS = 400_000; // ~100K tokens — trigger matryoshka above this
 const COMPACT_THRESHOLD = 1500; // chars — re-summarize verbose codex output above this
@@ -78,13 +78,13 @@ export interface Routed {
 
 // Model/effort presets — every (model, effort) pair lives here.
 const CODE_REVIEW: Preset = { model: DEFAULT_MODEL, effort: "medium" };
-const CODE_REVIEW_HARD: Preset = { model: DEFAULT_MODEL, effort: "high" };
-const CODE_REVIEW_COMPLEX: Preset = { model: DEFAULT_MODEL, effort: "xhigh" };
-const CODE_REVIEW_TINY: Preset = { model: DEFAULT_MODEL, effort: "low" };
+const CODE_REVIEW_HARD: Preset = { model: FRONTIER_MODEL, effort: "high" };
+const CODE_REVIEW_COMPLEX: Preset = { model: FRONTIER_MODEL, effort: "xhigh" };
+const CODE_REVIEW_TINY: Preset = { model: FAST_MODEL, effort: "low" };
 const THINKING: Preset = { model: DEFAULT_MODEL, effort: "medium" };
 const BASH_FAILURE: Preset = { model: DEFAULT_MODEL, effort: "low" };
 const BASH_REVIEW: Preset = { model: DEFAULT_MODEL, effort: "low" };
-const STOP_REVIEW: Preset = { model: DEFAULT_MODEL, effort: "medium" };
+const STOP_REVIEW: Preset = { model: FRONTIER_MODEL, effort: "medium" };
 const PRECOMPACT: Preset = { model: DEFAULT_MODEL, effort: "medium" };
 const SUMMARIZE: Preset = { model: FAST_MODEL, effort: "high" };
 
@@ -337,7 +337,7 @@ export function gateModelEffort(category: Category, filePath: string, snippet: s
 		return CODE_REVIEW_COMPLEX;
 	// Hard: any risk signal or large content.
 	if (fileHints.length > 0 || changeHints.length > 0 || size > 5000) return CODE_REVIEW_HARD;
-	// Medium-sized, no signals -> mini with bumped effort.
+	// Medium-sized, no signals -> fast model with bumped effort.
 	if (size > 1000) return { model: FAST_MODEL, effort: "high" };
 	return CODE_REVIEW;
 }
@@ -356,9 +356,6 @@ async function invokeCodex(
 ): Promise<string> {
 	if (extraSignal?.aborted) return ""; // deadline already fired — do not spawn
 	const m = process.env.CODEX_REFLECTOR_MODEL || model || DEFAULT_MODEL;
-	let e: Effort = effort;
-	// Lightning-fast model needs at least high effort.
-	if (m === LIGHTNING_FAST_MODEL && (e === "low" || e === "medium")) e = "high";
 
 	const outPath = join(tmpdir(), `codex-ref-${randomUUID()}.txt`);
 	try {
@@ -371,14 +368,14 @@ async function invokeCodex(
 				"--full-auto",
 				"--ephemeral",
 				"-c",
-				`model_reasoning_effort=${e}`,
+				`model_reasoning_effort=${effort}`,
 				"-m",
 				m,
 				"-o",
 				outPath,
 				"-", // read prompt from stdin
 			];
-			debug(`invoking codex (effort=${e}, model=${m})`);
+			debug(`invoking codex (effort=${effort}, model=${m})`);
 			const child = spawn("codex", args, {
 				cwd: cwd || undefined,
 				stdio: ["pipe", "ignore", "ignore"],
