@@ -13,6 +13,23 @@ This file is only for repo-specific constraints that are easy to break and expen
 - **Rule:** Any shipped OMP or Claude plugin code/config change bumps the paired release manifests in the same commit: the OMP version (`package.json` `version`) and the Claude plugin version in all three Claude fields (`.claude-plugin/plugin.json` `version`, plus both `version` and `plugins[0].version` in `.claude-plugin/marketplace.json`); also refresh any marketplace `metadata.lastUpdated` date present. Shared Python hook changes also bump the Cursor plugin version in all three Cursor fields (`.cursor-plugin/plugin.json` `version`, plus both `version` and `plugins[0].version` in `.cursor-plugin/marketplace.json`).
   **Why:** The OMP and Claude surfaces ship independently but evolve together, so bumping only one side hides paired release changes from users inspecting either manifest. The Python hook code also powers Cursor; Cursor manifests are tracked source, but they should move when the shared Python/Cursor surface changes rather than on OMP-only changes.
 
+## Model routing invariants
+
+- **Rule:** Keep three reviewer roles on both surfaces (`DEFAULT_MODEL`, `FRONTIER_MODEL`, `FAST_MODEL`), not a single shared slug. Map everyday presets (base code review, thinking, bash, precompact) to default; risk-escalated code review, plan review, and the holistic Stop review to frontier; tiny reviews, the mid-size gate branch, and summarize to fast. When OpenAI renames the lineup, re-pin the three role constants and keep the role→preset map; do not collapse roles onto one model.
+  **Why:** A single-model re-pin either burns frontier cost on tiny edits or under-spends on the only blocking path (Stop). Role drift between Python and OMP produces different review quality for Claude/Cursor vs OMP users.
+
+- **Rule:** Keep the effort ladder closed at `low | medium | high | xhigh` on both surfaces. NEVER extend it with catalog efforts such as `max` or `ultra`, and NEVER reintroduce a model-specific effort clamp (the deleted spark low/medium→high force).
+  **Why:** `ultra` is task-delegation oriented and wrong for a read-only reviewer. `max` risks blowing the OMP handler budget so reviews become silent fail-open no-ops. A model-specific clamp makes `CODEX_REFLECTOR_MODEL` lie about effort.
+
+- **Rule:** `CODEX_REFLECTOR_MODEL` may replace only the model slug on the Codex argv; the effort chosen by the route and gate MUST pass through verbatim on both surfaces.
+  **Why:** Operators use the override to A/B models. Rewriting effort under the override hides the real cost/latency of the chosen model and breaks the argv-capture contract that proves clamp removal.
+
+- **Rule:** Holistic Stop review stays on the frontier role at medium effort on BOTH surfaces. Do not move Stop to default or fast to save cost, and do not raise Stop to xhigh/max without an explicit product decision that re-checks the OMP handler budget.
+  **Why:** Stop is the sole blocking gate. Under-tiering it weakens the product; over-tiering it under OMP's ~30s handler race drops the review.
+
+- **Rule:** Model-routing tests MUST assert exact `(model, effort)` pairs for the three-way partition and MUST include argv-capture coverage for (1) Stop frontier@medium and (2) env override preserving effort. Any Stop/argv test that reads real `invokeCodex` output MUST clear ambient `CODEX_REFLECTOR_MODEL` for the duration of the assertion (save/delete/restore), or the override silently falsifies a correct preset.
+  **Why:** Effort-only or name-agnostic assertions let a silent model drift ship. Without env isolation, a developer machine with `CODEX_REFLECTOR_MODEL` set fails the Stop preset test while production routing is fine.
+
 ## Python Claude/Cursor plugin invariants
 
 - **Rule:** Keep `hooks/hooks.json` as routing glue and keep real classification in `classify()` inside `scripts/codex-reflector.py`. Cursor-specific matcher generation belongs in `scripts/install-cursor.sh`, not in the core dispatch path.
