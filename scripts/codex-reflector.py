@@ -51,7 +51,7 @@ _ME_PLAN_REVIEW = ModelEffort(FRONTIER_MODEL, "xhigh")
 _ME_THINKING = ModelEffort(DEFAULT_MODEL, "medium")
 _ME_BASH_FAILURE = ModelEffort(DEFAULT_MODEL, "low")
 _ME_STOP_REVIEW = ModelEffort(FRONTIER_MODEL, "medium")
-_ME_PRECOMPACT = ModelEffort(DEFAULT_MODEL, "medium")  # compaction
+_ME_PRECOMPACT = ModelEffort(FRONTIER_MODEL, "low")  # precompact metacognition
 _ME_SUMMARIZE = ModelEffort(FAST_MODEL, "high")
 _ME_SUBAGENT_REVIEW = ModelEffort(FAST_MODEL, "high")
 
@@ -1628,6 +1628,11 @@ def run_self_test() -> None:
             "Plan review is frontier@xhigh",
             (_ME_PLAN_REVIEW.model, _ME_PLAN_REVIEW.effort),
             (FRONTIER_MODEL, "xhigh"),
+        ),
+        (
+            "Precompact preset is frontier@low",
+            (_ME_PRECOMPACT.model, _ME_PRECOMPACT.effort),
+            (FRONTIER_MODEL, "low"),
         ),
     ]
     for desc, got, expected in routing_cases:

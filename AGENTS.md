@@ -15,7 +15,7 @@ This file is only for repo-specific constraints that are easy to break and expen
 
 ## Model routing invariants
 
-- **Rule:** Keep three reviewer roles on both surfaces (`DEFAULT_MODEL`, `FRONTIER_MODEL`, `FAST_MODEL`), not a single shared slug. Map everyday presets (base code review, thinking, bash, precompact) to default; risk-escalated code review, plan review, and the holistic Stop review to frontier; tiny reviews, the mid-size gate branch, and summarize to fast. When OpenAI renames the lineup, re-pin the three role constants and keep the role→preset map; do not collapse roles onto one model.
+- **Rule:** Keep three reviewer roles on both surfaces (`DEFAULT_MODEL`, `FRONTIER_MODEL`, `FAST_MODEL`), not a single shared slug. Map everyday presets (base code review, thinking, bash) to default; risk-escalated code review, plan review, the holistic Stop review, and precompact metacognition to frontier; tiny reviews, the mid-size gate branch, and summarize to fast. When OpenAI renames the lineup, re-pin the three role constants and keep the role→preset map; do not collapse roles onto one model.
   **Why:** A single-model re-pin either burns frontier cost on tiny edits or under-spends on the only blocking path (Stop). Role drift between Python and OMP produces different review quality for Claude/Cursor vs OMP users.
 
 - **Rule:** Keep the effort ladder closed at `low | medium | high | xhigh` on both surfaces. NEVER extend it with catalog efforts such as `max` or `ultra`, and NEVER reintroduce a model-specific effort clamp (the deleted spark low/medium→high force).
@@ -26,6 +26,9 @@ This file is only for repo-specific constraints that are easy to break and expen
 
 - **Rule:** Holistic Stop review stays on the frontier role at medium effort on BOTH surfaces. Do not move Stop to default or fast to save cost, and do not raise Stop to xhigh/max without an explicit product decision that re-checks the OMP handler budget.
   **Why:** Stop is the sole blocking gate. Under-tiering it weakens the product; over-tiering it under OMP's ~30s handler race drops the review.
+
+- **Rule:** Precompact metacognition stays on the frontier role at low effort on BOTH surfaces. Do not leave it on default/medium after the sol retier, and do not raise it to medium/high without re-checking the OMP handler budget (precompact can matryoshka-compact a large transcript first).
+  **Why:** Precompact is advisory but session-wide; frontier@low is the chosen quality/latency tradeoff. Drift back to default silently undoes the product decision.
 
 - **Rule:** Model-routing tests MUST assert exact `(model, effort)` pairs for the three-way partition and MUST include argv-capture coverage for (1) Stop frontier@medium and (2) env override preserving effort. Any Stop/argv test that reads real `invokeCodex` output MUST clear ambient `CODEX_REFLECTOR_MODEL` for the duration of the assertion (save/delete/restore), or the override silently falsifies a correct preset.
   **Why:** Effort-only or name-agnostic assertions let a silent model drift ship. Without env isolation, a developer machine with `CODEX_REFLECTOR_MODEL` set fails the Stop preset test while production routing is fine.

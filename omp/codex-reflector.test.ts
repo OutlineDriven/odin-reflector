@@ -365,6 +365,58 @@ exit 0
 		}
 	}, 15_000);
 
+	test("session_before_compact invokes codex with the frontier precompact preset", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const argsLog = join(binDir, "args.log");
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh
+ARGS_LOG=${JSON.stringify(argsLog)}
+printf '%s\\n' "$*" >> "$ARGS_LOG"
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] && printf 'reflect\\n' > "$out"
+exit 0
+`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
+		process.env.PATH = `${binDir}:${prevPath}`;
+		delete process.env.CODEX_REFLECTOR_MODEL;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("session_before_compact");
+			expect(handler).toBeDefined();
+			await handler?.(
+				{
+					type: "session_before_compact",
+					preparation: {
+						messagesToSummarize: [{ role: "user", content: "work to reflect on" }],
+					},
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
+			// One main precompact invoke; matryoshka may not fire for a short transcript.
+			expect(argsLines.length).toBeGreaterThanOrEqual(1);
+			const precompactLine = argsLines[argsLines.length - 1] ?? "";
+			expect(precompactLine).toContain("-m gpt-5.6-sol");
+			expect(precompactLine).toContain("model_reasoning_effort=low");
+		} finally {
+			process.env.PATH = prevPath;
+			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
+			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
 	test("session_stop with stop_hook_active=true settles without re-reviewing", async () => {
 		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 		const invokeLog = join(binDir, "invoked.log");

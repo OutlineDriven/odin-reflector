@@ -13,7 +13,7 @@ The native oh-my-pi extension that registers the same review idea as hook handle
 ## Model routing
 
 ### Model tier
-One of three reviewer roles the reflector assigns before calling Codex: default (everyday), frontier (risk-escalated and Stop), and fast (tiny, mid-size gate, summarize). Slugs change when OpenAI renames the lineup; the three roles do not.
+One of three reviewer roles the reflector assigns before calling Codex: default (everyday), frontier (risk-escalated, Stop, and precompact), and fast (tiny, mid-size gate, summarize). Slugs change when OpenAI renames the lineup; the three roles do not.
 
 ### Effort ladder
 The closed set of reasoning efforts the reflector may send: low, medium, high, xhigh. Catalog values outside that set (including max and ultra) are intentionally unused.
@@ -29,5 +29,5 @@ The single blocking review run once per stop chain. It uses the frontier tier at
 
 ## Flagged ambiguities
 
-- "'Default model' is not 'frontier model'" — everyday presets stay on the default tier; only risk-escalated reviews and Stop use frontier.
+- "'Default model' is not 'frontier model'" — everyday presets stay on the default tier; risk-escalated reviews, Stop, and precompact use frontier.
 - "'Model override' is not an effort override" — the env var never rewrites `model_reasoning_effort`.

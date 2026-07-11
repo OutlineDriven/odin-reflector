@@ -30,18 +30,18 @@ Keep a three-role partition, not a single model:
 
 | Role | Current slug | Owns |
 |------|--------------|------|
-| Default | `gpt-5.6-terra` | Everyday reviews, thinking, bash, precompact |
-| Frontier | `gpt-5.6-sol` | Risk-escalated code review, plan review, holistic Stop |
+| Default | `gpt-5.6-terra` | Everyday reviews, thinking, bash |
+| Frontier | `gpt-5.6-sol` | Risk-escalated code review, plan review, holistic Stop, precompact @ low |
 | Fast | `gpt-5.6-luna` | Tiny reviews, mid-size gate, summarize |
 
 Rules that must survive the next re-tier:
 
 1. **Stop is frontier @ medium on both surfaces.** The holistic Stop gate is the only blocking path; it rides the frontier model. Do not put Stop on the default or fast tier to save cost.
-2. **Effort ladder stays `low | medium | high | xhigh`.** Do not add `max` or `ultra`. `ultra` is task-delegation oriented (wrong for a read-only reviewer). `max` risks blowing the OMP handler budget and turning reviews into silent fail-open no-ops.
-3. **No spark clamp.** Delete any model-specific "force effort up to high" branch. `CODEX_REFLECTOR_MODEL` may swap `-m` only; the route's effort passes through verbatim, even when the override is a legacy spark slug.
-4. **Parity on both surfaces.** Python (`scripts/codex-reflector.py`) and OMP (`omp/codex-reflector.ts`) must share the same role assignment and effort table. Ship code + all paired manifests in the same commit (AGENTS.md).
-5. **Tests hard-code the three-way partition.** `gateModelEffort` assertions use exact `(model, effort)` pairs. Argv-capture tests prove Stop uses frontier @ medium and that a model override preserves effort. Stop argv tests must clear ambient `CODEX_REFLECTOR_MODEL` or the override hides a correct preset.
-
+2. **Precompact is frontier @ low on both surfaces.** Session metacognition before compaction uses sol at low effort. Do not leave it on terra/medium.
+3. **Effort ladder stays `low | medium | high | xhigh`.** Do not add `max` or `ultra`. `ultra` is task-delegation oriented (wrong for a read-only reviewer). `max` risks blowing the OMP handler budget and turning reviews into silent fail-open no-ops.
+4. **No spark clamp.** Delete any model-specific "force effort up to high" branch. `CODEX_REFLECTOR_MODEL` may swap `-m` only; the route's effort passes through verbatim, even when the override is a legacy spark slug.
+5. **Parity on both surfaces.** Python (`scripts/codex-reflector.py`) and OMP (`omp/codex-reflector.ts`) must share the same role assignment and effort table. Ship code + all paired manifests in the same commit (AGENTS.md).
+6. **Tests hard-code the three-way partition.** `gateModelEffort` assertions use exact `(model, effort)` pairs. Argv-capture tests prove Stop uses frontier @ medium, precompact uses frontier @ low, and that a model override preserves effort. Stop/argv tests must clear ambient `CODEX_REFLECTOR_MODEL` or the override hides a correct preset.
 ## Why This Matters
 
 A single-model re-pin wastes frontier spend on tiny edits and under-spends on Stop. A spark clamp lies about effort under env overrides. Catalog efforts that look "stronger" can drop the review entirely under the OMP 30s handler race. Soft tests that only check effort let a silent model drift ship.

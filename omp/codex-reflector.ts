@@ -85,7 +85,7 @@ const THINKING: Preset = { model: DEFAULT_MODEL, effort: "medium" };
 const BASH_FAILURE: Preset = { model: DEFAULT_MODEL, effort: "low" };
 const BASH_REVIEW: Preset = { model: DEFAULT_MODEL, effort: "low" };
 const STOP_REVIEW: Preset = { model: FRONTIER_MODEL, effort: "medium" };
-const PRECOMPACT: Preset = { model: DEFAULT_MODEL, effort: "medium" };
+const PRECOMPACT: Preset = { model: FRONTIER_MODEL, effort: "low" };
 const SUMMARIZE: Preset = { model: FAST_MODEL, effort: "high" };
 
 // Compact output directives — verdict vs non-verdict prompts.
