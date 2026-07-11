@@ -422,11 +422,11 @@ def _gate_model_effort(
     change_hints = _change_size_heuristics(content, old, new)
 
     # Tiny + no risk signals → lightweight. Cover Write `content` and Edit
-    # replacements alike. Pure deletions (`new_string` empty) and empty
-    # payloads stay on the default path — require a non-empty replacement
+    # replacements/insertions alike. Pure deletions (`new_string` empty) and
+    # empty payloads stay on the default path — require a non-empty `new`
     # before treating an Edit as tiny.
     has_content = bool(content)
-    has_replacement = bool(old) and bool(new)
+    has_replacement = bool(new)
     tiny = (has_content and len(content) < 200) or (
         has_replacement and len(old) < 200 and len(new) < 200
     )
@@ -1545,6 +1545,20 @@ def run_self_test() -> None:
                     "file_path": "src/util.ts",
                     "old_string": "a",
                     "new_string": "b",
+                },
+            ),
+            (FAST_MODEL, "low"),
+        ),
+        (
+            "Edit pure insertion tiny -> luna/low",
+            _gate_model_effort(
+                "code_change",
+                base_m,
+                base_e,
+                {
+                    "file_path": "src/util.ts",
+                    "old_string": "",
+                    "new_string": "const x = 1;",
                 },
             ),
             (FAST_MODEL, "low"),
