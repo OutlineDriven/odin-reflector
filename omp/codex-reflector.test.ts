@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 
 import codexReflector, {
+	bashGuardDecision,
 	changeSizeHeuristics,
 	classify,
 	codeReviewResponse,
@@ -68,10 +69,11 @@ describe("classify", () => {
 		expect(classify("write", false)?.category).toBe("code_change");
 		expect(classify("edit", false)?.category).toBe("code_change");
 		expect(classify("ast_edit", false)?.category).toBe("code_change");
+		expect(classify("fast_edit", false)?.category).toBe("code_change");
 	});
-	test("bash failure -> bash_failure, bash success -> bash_success", () => {
+	test("bash failure -> bash_failure, bash success -> null", () => {
 		expect(classify("bash", true)?.category).toBe("bash_failure");
-		expect(classify("bash", false)?.category).toBe("bash_success");
+		expect(classify("bash", false)).toBeNull();
 	});
 	test("non-reviewed tools -> null", () => {
 		expect(classify("read", false)).toBeNull();
@@ -89,6 +91,15 @@ describe("classify", () => {
 		expect(
 			classify("mcp__morph__edit_file", true, { code_edit: "x", instruction: "y" })?.category,
 		).toBe("code_change_failure");
+	});
+	test("native fast_edit failure WITH Morph payload -> code_change_failure", () => {
+		expect(
+			classify("fast_edit", true, { code_edit: "x", instructions: "y" })?.category,
+		).toBe("code_change_failure");
+	});
+	test("native fast_edit failure WITHOUT complete payload -> null", () => {
+		expect(classify("fast_edit", true)).toBeNull();
+		expect(classify("fast_edit", true, { code_edit: "x" })).toBeNull();
 	});
 	test("Fast-Apply MCP failure WITHOUT payload -> null (name match alone is insufficient)", () => {
 		expect(classify("mcp__morph__edit_file", true)).toBeNull();
@@ -224,11 +235,11 @@ describe("factory", () => {
 		return { pi: stub as unknown as ExtensionAPI, events, handlers, sendMessageCalls };
 	}
 
-	test("registers the three lifecycle handlers", () => {
+	test("registers the four lifecycle handlers", () => {
 		const { pi, events } = makePi();
 		codexReflector(pi);
 		expect(new Set(events)).toEqual(
-			new Set(["tool_result", "session_stop", "session_before_compact"]),
+			new Set(["tool_result", "tool_call", "session_stop", "session_before_compact"]),
 		);
 	});
 
@@ -464,9 +475,9 @@ exit 0
 			rmSync(binDir, { recursive: true, force: true });
 		}
 	}, 15_000);
-	// Per-tool code-review is advisory: every verdict (PASS/UNCERTAIN/FAIL) rides along as
-	// appended content and NONE sets isError, so a succeeded edit/command is never blocked.
-	// Enforcement lives in the holistic session_stop review (see STOP_VERDICTS), not here.
+	// Per-tool code review is advisory: every verdict (PASS/UNCERTAIN/FAIL) rides along as
+	// appended content and NONE sets isError, so a succeeded edit is never blocked.
+	// Enforcement is separate: pre-execution bash guard and holistic session_stop review.
 	// The fake codex writes the verdict to the -o file (invokeCodex ignores stdout).
 	const CODE_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string }> = [
 		{ name: "PASS", out: "PASS" },
@@ -567,14 +578,58 @@ exit 0
 			rmSync(binDir, { recursive: true, force: true });
 		}
 	}, 15_000);
-	// Successful bash command review: same PASS/UNCERTAIN/FAIL contract as code_change.
-	const BASH_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string }> = [
-		{ name: "PASS", out: "PASS" },
-		{ name: "UNCERTAIN", out: "still investigating" },
-		{ name: "FAIL", out: "FAIL: leaked secret" },
+
+	test("fast_edit tool_result appends an advisory review with the target path", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf 'PASS\\n' > "$out"\nexit 0\n`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		process.env.PATH = `${binDir}:${prevPath}`;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("tool_result");
+			expect(handler).toBeDefined();
+			const result = (await handler?.(
+				{
+					type: "tool_result",
+					toolName: "fast_edit",
+					toolCallId: "id",
+					input: {
+						target_filepath: "src/a.ts",
+						instructions: "add guard",
+						code_edit: "// marker\nif (!x) return;",
+					},
+					content: [{ type: "text", text: "Applied edit to src/a.ts" }],
+					isError: false,
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			)) as { content?: Array<{ type: string; text: string }>; isError?: boolean } | undefined;
+			expect(result).toBeDefined();
+			expect(result?.isError).toBeFalsy();
+			const last = result?.content?.at(-1);
+			expect(last?.text).toContain("PASS");
+			expect(last?.text).toContain("[src/a.ts]");
+		} finally {
+			process.env.PATH = prevPath;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	const BASH_GUARD_VERDICTS: ReadonlyArray<{
+		name: string;
+		out: string;
+		blocked: boolean;
+	}> = [
+		{ name: "FAIL", out: "FAIL: destroys data outside workspace", blocked: true },
+		{ name: "PASS", out: "PASS", blocked: false },
+		{ name: "UNCERTAIN", out: "still checking", blocked: false },
 	];
-	for (const c of BASH_REVIEW_VERDICTS) {
-		test(`tool_result bash_success ${c.name} stays advisory`, async () => {
+	for (const c of BASH_GUARD_VERDICTS) {
+		test(`tool_call bash guard ${c.name} ${c.blocked ? "blocks" : "fails open"}`, async () => {
 			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 			writeFileSync(
 				join(binDir, "codex"),
@@ -582,39 +637,125 @@ exit 0
 			);
 			chmodSync(join(binDir, "codex"), 0o755);
 			const prevPath = process.env.PATH ?? "";
+			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
 			process.env.PATH = `${binDir}:${prevPath}`;
+			delete process.env.CODEX_REFLECTOR_BASH_GUARD;
 			try {
 				const { pi, handlers } = makePi();
 				codexReflector(pi);
-				const handler = handlers.get("tool_result");
+				const handler = handlers.get("tool_call");
 				expect(handler).toBeDefined();
-				const event = {
-					type: "tool_result",
-					toolName: "bash",
-					toolCallId: "id",
-					input: { command: "ls" },
-					content: [{ type: "text", text: "ok" }],
-					isError: false,
-				} as unknown as Parameters<NonNullable<typeof handler>>[0];
-				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
-					NonNullable<typeof handler>
-				>[1];
-				const result = (await handler?.(event, ctx)) as
-					| { content?: Array<{ type: string; text: string }>; isError?: boolean }
-					| undefined;
-				expect(result).toBeDefined();
-				expect(result?.isError).toBeFalsy();
-				expect(result?.content).toHaveLength(2);
-				expect(result?.content?.[0]).toEqual({ type: "text", text: "ok" });
-				const last = result?.content?.at(-1);
-				expect(last?.type).toBe("text");
-				expect(last?.text).toContain(c.name);
+				const result = (await handler?.(
+					{
+						type: "tool_call",
+						toolName: "bash",
+						toolCallId: "id",
+						input: { command: "rm -rf /" },
+					},
+					{ cwd: ".", hasUI: false, ui: { notify() {} } },
+				)) as { block?: boolean; reason?: string } | undefined;
+				if (c.blocked) {
+					expect(result).toEqual({
+						block: true,
+						reason: expect.stringContaining("Codex Bash Guard FAIL"),
+					});
+				} else {
+					expect(result).toBeUndefined();
+				}
 			} finally {
 				process.env.PATH = prevPath;
+				if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+				else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
 				rmSync(binDir, { recursive: true, force: true });
 			}
 		}, 15_000);
 	}
+
+	test("CODEX_REFLECTOR_BASH_GUARD=0 skips codex and allows the command", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const invokeLog = join(binDir, "invoked.log");
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 1\n`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
+		process.env.PATH = `${binDir}:${prevPath}`;
+		process.env.CODEX_REFLECTOR_BASH_GUARD = "0";
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const result = await handlers.get("tool_call")?.(
+				{
+					type: "tool_call",
+					toolName: "bash",
+					toolCallId: "id",
+					input: { command: "echo hi" },
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+			expect(existsSync(invokeLog)).toBe(false);
+		} finally {
+			process.env.PATH = prevPath;
+			if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+			else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	});
+
+	test("bash pre-guard invokes luna at low effort", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const argsLog = join(binDir, "args.log");
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(argsLog)}
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$out" ] && printf 'PASS\\n' > "$out"
+exit 0
+`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
+		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
+		process.env.PATH = `${binDir}:${prevPath}`;
+		delete process.env.CODEX_REFLECTOR_MODEL;
+		delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const result = await handlers.get("tool_call")?.(
+				{
+					type: "tool_call",
+					toolName: "bash",
+					toolCallId: "id",
+					input: { command: "echo hi" },
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
+			expect(argsLines).toHaveLength(1);
+			expect(argsLines[0]).toContain("-m gpt-5.6-luna");
+			expect(argsLines[0]).toContain("model_reasoning_effort=low");
+		} finally {
+			process.env.PATH = prevPath;
+			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
+			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
+			if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+			else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
 	test("tool_result fails open when codex hangs (deadline SIGKILLs the child)", async () => {
 		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 		const fake = join(binDir, "codex");
@@ -722,9 +863,9 @@ exit 0
 			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: [{ type: "text", text: "boom" }], isError: true },
 		},
 		{
-			label: "tool_result/bash_success",
-			handler: "tool_result",
-			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: [{ type: "text", text: "ok" }], isError: false },
+			label: "tool_call/bash_guard",
+			handler: "tool_call",
+			event: { type: "tool_call", toolName: "bash", toolCallId: "id", input: { command: "echo hi" } },
 		},
 		{
 			label: "tool_result/code_change_failure",
@@ -749,21 +890,18 @@ exit 0
 			writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> "${invokeLog}"\nexec sleep 30\n`);
 			chmodSync(join(binDir, "codex"), 0o755);
 			const prevPath = process.env.PATH ?? "";
+			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
 			process.env.PATH = `${binDir}:${prevPath}`;
+			delete process.env.CODEX_REFLECTOR_BASH_GUARD;
 			testSetHandlerBudgetMs(300); // > spawn+log time, << the 5s assert / 25s guard
 			try {
 				const { pi, handlers } = makePi();
 				codexReflector(pi);
 				const handler = handlers.get(route.handler);
 				expect(handler).toBeDefined();
-				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
-					NonNullable<typeof handler>
-				>[1];
+				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } };
 				const start = Date.now();
-				const result = await handler?.(
-					route.event as unknown as Parameters<NonNullable<typeof handler>>[0],
-					ctx,
-				);
+				const result = await handler?.(route.event, ctx);
 				const elapsed = Date.now() - start;
 				expect(result).toBeUndefined(); // fail-open on every route
 				expect(elapsed).toBeLessThan(5_000); // deadline fired, not the 25s guard
@@ -776,6 +914,8 @@ exit 0
 				}
 			} finally {
 				process.env.PATH = prevPath;
+				if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+				else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
 				testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
 				rmSync(binDir, { recursive: true, force: true });
 			}
@@ -802,9 +942,14 @@ exit 0
 			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: Array.from({ length: 4 }, () => ({ type: "text", text: "a".repeat(8000) })), isError: true },
 		},
 		{
-			label: "tool_result/bash_success (output > 20k compaction threshold)",
-			handler: "tool_result",
-			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: Array.from({ length: 4 }, () => ({ type: "text", text: "a".repeat(8000) })), isError: false },
+			label: "tool_call/bash_guard (command > 400k compaction threshold)",
+			handler: "tool_call",
+			event: {
+				type: "tool_call",
+				toolName: "bash",
+				toolCallId: "id",
+				input: { command: `printf %s ${"a".repeat(410_000)}` },
+			},
 		},
 		{
 			label: "session_stop (transcript > 400k compaction threshold)",
@@ -824,21 +969,18 @@ exit 0
 			writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> "${invokeLog}"\nexec sleep 30\n`);
 			chmodSync(join(binDir, "codex"), 0o755);
 			const prevPath = process.env.PATH ?? "";
+			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
 			process.env.PATH = `${binDir}:${prevPath}`;
+			delete process.env.CODEX_REFLECTOR_BASH_GUARD;
 			testSetHandlerBudgetMs(300); // > redact+spawn of the large input, << the 5s assert / 25s guard
 			try {
 				const { pi, handlers } = makePi();
 				codexReflector(pi);
 				const handler = handlers.get(route.handler);
 				expect(handler).toBeDefined();
-				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
-					NonNullable<typeof handler>
-				>[1];
+				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } };
 				const start = Date.now();
-				const result = await handler?.(
-					route.event as unknown as Parameters<NonNullable<typeof handler>>[0],
-					ctx,
-				);
+				const result = await handler?.(route.event, ctx);
 				const elapsed = Date.now() - start;
 				expect(result).toBeUndefined(); // fail-open on the indirect compaction path
 				expect(elapsed).toBeLessThan(5_000); // deadline fired, not the 25s guard
@@ -851,6 +993,8 @@ exit 0
 				}
 			} finally {
 				process.env.PATH = prevPath;
+				if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+				else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
 				testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
 				rmSync(binDir, { recursive: true, force: true });
 			}
@@ -967,6 +1111,19 @@ describe("resolveChangeTarget", () => {
 		expect(r.rawSnippet).toContain("EDIT-SKETCH"); // code_edit sketch
 	});
 
+	test("native fast_edit uses target_filepath and plural instructions", () => {
+		const event = evt("fast_edit", {
+			target_filepath: "src/a.ts",
+			instructions: "add guard",
+			code_edit: "// marker\nif (!x) return;",
+		});
+		event.content = [{ type: "text", text: "Applied edit to src/a.ts" }];
+		const r = resolveChangeTarget(event);
+		expect(r.filePath).toBe("src/a.ts");
+		expect(r.rawSnippet).toContain("add guard");
+		expect(r.rawSnippet).toContain("if (!x) return;");
+	});
+
 	test("ast_edit dedups repeated paths (avoids self-superseding generations)", () => {
 		const r = resolveChangeTarget(evt("ast_edit", { paths: ["a.ts", "a.ts", "b.ts"] }));
 		expect(r.filePaths).toEqual(["a.ts", "b.ts"]);
@@ -1033,5 +1190,19 @@ describe("stopReviewDecision", () => {
 	});
 	test("UNCERTAIN settles (returns undefined — never block on uncertainty)", () => {
 		expect(stopReviewDecision("UNCERTAIN", "unsure")).toBeUndefined();
+	});
+});
+
+describe("bashGuardDecision", () => {
+	test("FAIL blocks with the guard review as reason", () => {
+		const result = bashGuardDecision("FAIL", "destroys data outside workspace");
+		expect(result).toEqual({
+			block: true,
+			reason: expect.stringContaining("Codex Bash Guard FAIL"),
+		});
+	});
+	test("PASS and UNCERTAIN fail open", () => {
+		expect(bashGuardDecision("PASS", "safe")).toBeUndefined();
+		expect(bashGuardDecision("UNCERTAIN", "still checking")).toBeUndefined();
 	});
 });
