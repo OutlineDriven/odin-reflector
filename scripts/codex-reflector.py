@@ -296,8 +296,10 @@ _SKIP_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# MCP substrings for code-editing tools
-_MCP_EDIT_MARKERS: tuple[str, ...] = ("morph-mcp", "mcp__morph", "__edit_file")
+# MCP substring for code-editing tools. Explicit edit-function marker only:
+# bare Morph server markers would route non-edit Morph tools (fastcompact,
+# warpgrep) into code-change review.
+_MCP_EDIT_MARKERS: tuple[str, ...] = ("__edit_file",)
 
 
 def _is_fast_apply(tool_name: str) -> bool:
@@ -1416,6 +1418,29 @@ def run_self_test() -> None:
         status = "OK" if ok else "FAIL"
         print(
             f"  {status}: _is_fast_apply({tool_name!r}) -> {got} (expected {expected})"
+        )
+        all_total += 1
+        if ok:
+            all_passed += 1
+
+    # --- MCP classify routing tests ---
+    print("\n=== MCP Classify Routing ===")
+    mcp_classify_cases = [
+        ("mcp__morph__edit_file", "code_change"),
+        ("mcp__morphllm__edit_file", "code_change"),
+        ("mcp__morph__fastcompact", None),
+        ("mcp__morph__flashcompact", None),
+        ("mcp__morph__warpgrep", None),
+        ("fastcompact", None),
+        ("flashcompact", None),
+    ]
+    for tool_name, expected_cat in mcp_classify_cases:
+        routed = classify(tool_name, "PostToolUse")
+        got_cat = routed[0] if routed else None
+        ok = got_cat == expected_cat
+        status = "OK" if ok else "FAIL"
+        print(
+            f"  {status}: classify({tool_name!r}) -> {got_cat!r} (expected {expected_cat!r})"
         )
         all_total += 1
         if ok:
