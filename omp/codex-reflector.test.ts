@@ -21,6 +21,7 @@ import codexReflector, {
 	redact,
 	renderTranscript,
 	resolveChangeTarget,
+	resolveDeviceWrite,
 	sandboxContent,
 	stopReviewDecision,
 	testSetHandlerBudgetMs,
@@ -703,6 +704,81 @@ exit 0
 		}
 	}, 15_000);
 
+	test("fastcompact device write is not reviewed", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf 'PASS\\n' > "$out"\nexit 0\n`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		process.env.PATH = `${binDir}:${prevPath}`;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("tool_result");
+			expect(handler).toBeDefined();
+			const result = await handler?.(
+				{
+					type: "tool_result",
+					toolName: "write",
+					toolCallId: "id",
+					input: { path: "xd://fastcompact", content: JSON.stringify({ location: "README.md" }) },
+					content: [{ type: "text", text: "compacted" }],
+					isError: false,
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+		} finally {
+			process.env.PATH = prevPath;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	test("fast_edit device write is reviewed with its real target", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf 'PASS\\n' > "$out"\nexit 0\n`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		process.env.PATH = `${binDir}:${prevPath}`;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("tool_result");
+			expect(handler).toBeDefined();
+			const result = (await handler?.(
+				{
+					type: "tool_result",
+					toolName: "write",
+					toolCallId: "id",
+					input: {
+						path: "xd://fast_edit",
+						content: JSON.stringify({
+							target_filepath: "src/a.ts",
+							instructions: "add guard",
+							code_edit: "// marker\nif (!x) return;",
+						}),
+					},
+					content: [{ type: "text", text: "Applied edit to src/a.ts" }],
+					isError: false,
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			)) as { content?: Array<{ type: string; text: string }>; isError?: boolean } | undefined;
+			expect(result).toBeDefined();
+			expect(result?.isError).toBeFalsy();
+			const last = result?.content?.at(-1);
+			expect(last?.text).toContain("PASS");
+			expect(last?.text).toContain("[src/a.ts]");
+		} finally {
+			process.env.PATH = prevPath;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
 	const BASH_GUARD_VERDICTS: ReadonlyArray<{
 		name: string;
 		out: string;
@@ -1245,6 +1321,74 @@ describe("resolveChangeTarget", () => {
 	test("ast_edit dedups repeated paths (avoids self-superseding generations)", () => {
 		const r = resolveChangeTarget(evt("ast_edit", { paths: ["a.ts", "a.ts", "b.ts"] }));
 		expect(r.filePaths).toEqual(["a.ts", "b.ts"]);
+	});
+});
+
+describe("resolveDeviceWrite", () => {
+	// Test fixture: minimal tool_result event. Single assertion to the domain
+	// type (no double-cast) — the reflector only reads toolName/input/isError.
+	function evt(toolName: string, input: Record<string, unknown>, isError = false): ToolResultEvent {
+		return {
+			type: "tool_result",
+			toolName,
+			toolCallId: "id",
+			input,
+			content: [],
+			isError,
+		} as ToolResultEvent;
+	}
+
+	test("plain workspace path passes through unchanged", () => {
+		const r = resolveDeviceWrite(evt("write", { path: "src/a.ts", content: "x" }));
+		expect(r?.toolName).toBe("write");
+	});
+
+	test("non-write event passes through unchanged", () => {
+		const r = resolveDeviceWrite(evt("read", { path: "src/a.ts" }));
+		expect(r?.toolName).toBe("read");
+	});
+
+	test("xd://fast_edit unwraps to the device tool with parsed args", () => {
+		const r = resolveDeviceWrite(
+			evt("write", {
+				path: "xd://fast_edit",
+				content: JSON.stringify({ target_filepath: "src/a.ts", instructions: "g", code_edit: "c" }),
+			}),
+		);
+		expect(r?.toolName).toBe("fast_edit");
+		expect(r?.input.target_filepath).toBe("src/a.ts");
+	});
+
+	test("xd://fastcompact unwraps but classify() still skips it", () => {
+		const r = resolveDeviceWrite(
+			evt("write", { path: "xd://fastcompact", content: JSON.stringify({ location: "README.md" }) }),
+		);
+		expect(r).not.toBeNull();
+		expect(r?.toolName).toBe("fastcompact");
+		if (r) expect(classify(r.toolName, false, r.input)).toBeNull();
+	});
+
+	test("failed xd:// device write is skipped (null)", () => {
+		const r = resolveDeviceWrite(evt("write", { path: "xd://fast_edit", content: "{}" }, true));
+		expect(r).toBeNull();
+	});
+
+	test("xd://ast_edit unwraps to ast_edit", () => {
+		const r = resolveDeviceWrite(
+			evt("write", { path: "xd://ast_edit", content: JSON.stringify({ paths: ["a.ts"], ops: [] }) }),
+		);
+		expect(r?.toolName).toBe("ast_edit");
+	});
+
+	test("non-xd scheme (local://) is skipped (null)", () => {
+		const r = resolveDeviceWrite(evt("write", { path: "local://plan.md", content: "x" }));
+		expect(r).toBeNull();
+	});
+
+	test("unparseable device args leave input empty without throwing", () => {
+		const r = resolveDeviceWrite(evt("write", { path: "xd://fast_edit", content: "not json" }));
+		expect(r?.toolName).toBe("fast_edit");
+		expect(r?.input).toEqual({});
 	});
 });
 

@@ -312,6 +312,42 @@ function isFastApplyTool(toolName: string): boolean {
 	return toolName === "fast_edit" || (toolName.startsWith("mcp__") && toolName.includes("__edit_file"));
 }
 
+// A workspace file path never carries a URI scheme; a scheme means the write
+// targets a device or internal location, not a source file to review.
+const URI_SCHEME_RE = /^([a-z][a-z0-9+.-]*):\/\//i;
+
+/**
+ * oh-my-pi invokes xd:// device tools (Morph fast_edit/fastcompact, ast_grep,
+ * lsp, browser, …) as a `write` whose path is `xd://<device>` and whose content
+ * is the device's JSON args. Resolve such a write to the event the classifier
+ * should actually see:
+ *   - non-`write` event, or plain file path → returned unchanged
+ *   - failed scheme write, or a successful non-`xd` scheme (local://, memory://,
+ *     artifact://, …) → null (no workspace file to review)
+ *   - successful `xd://<device>` write → unwrapped to { toolName: device,
+ *     input: <parsed args> } so classify() routes it by the real tool
+ *     (fast_edit/ast_edit → code_change; fastcompact/ast_grep/… → null)
+ */
+export function resolveDeviceWrite(event: ToolResultEvent): ToolResultEvent | null {
+	if (event.toolName !== "write") return event;
+	const path = typeof event.input.path === "string" ? event.input.path : "";
+	const scheme = path.match(URI_SCHEME_RE)?.[1];
+	if (!scheme) return event; // plain workspace path — unchanged
+	if (event.isError || scheme !== "xd") return null; // failed, or non-file target — skip
+	const device = path.slice("xd://".length);
+	let input: Record<string, unknown> = {};
+	const rawArgs = event.input.content;
+	if (typeof rawArgs === "string") {
+		try {
+			const parsed = JSON.parse(rawArgs);
+			if (parsed && typeof parsed === "object") input = parsed as Record<string, unknown>;
+		} catch {
+			/* unparseable args: leave input empty; classify routes by device name */
+		}
+	}
+	return { ...event, toolName: device, input };
+}
+
 function isTruthy(input: Record<string, unknown> | undefined, key: string): boolean {
 	if (!input) return false;
 	const value = input[key];
@@ -1013,42 +1049,44 @@ export default function codexReflector(pi: ExtensionAPI): void {
 	pi.on("tool_result", async (event, ctx) => {
 		let deadline: ReturnType<typeof handlerDeadline> | undefined;
 		try {
-			const routed = classify(event.toolName, event.isError ?? false, event.input);
+			const ev = resolveDeviceWrite(event);
+			if (!ev) return undefined;
+			const routed = classify(ev.toolName, ev.isError ?? false, ev.input);
 			if (!routed) return undefined;
 			const cwd = ctx.cwd || process.cwd();
 			deadline = handlerDeadline();
 			const signal = deadline.signal;
 			if (routed.category === "code_change") {
-				const { filePath, rawSnippet } = resolveChangeTarget(event);
+				const { filePath, rawSnippet } = resolveChangeTarget(ev);
 				const snippet = await compactSnippet(rawSnippet, cwd, signal);
 				const preset = gateModelEffort("code_change", filePath, snippet);
 				const extraFocus = [...fileHeuristics(filePath), ...changeSizeHeuristics(snippet.length)];
-				const prompt = buildCodeReviewPrompt(event.toolName, filePath, snippet, "", extraFocus);
+				const prompt = buildCodeReviewPrompt(ev.toolName, filePath, snippet, "", extraFocus);
 				const raw = await invokeCodex(prompt, cwd, preset.effort, preset.model, signal);
 				if (!raw) return undefined;
 				const verdict = parseVerdict(raw);
 				const out = await compactOutput(raw, cwd);
 				notifyUI(ctx, `Codex ${verdict} [${filePath}]`, verdict === "FAIL" ? "warning" : "info");
-				return codeReviewResponse(verdict, filePath, out, event.content);
+				return codeReviewResponse(verdict, filePath, out, ev.content);
 			}
 
 
 			if (routed.category === "thinking") {
-				const prompt = await buildThinkingPrompt(event.toolName, event.input, cwd, signal);
+				const prompt = await buildThinkingPrompt(ev.toolName, ev.input, cwd, signal);
 				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model, signal);
 				if (!raw) return undefined;
 				const out = await compactOutput(raw, cwd);
 				return {
 					content: [
-						...event.content,
+						...ev.content,
 						{ type: "text" as const, text: `Codex Metacognition:\n${out}` },
 					],
 				};
 			}
 
 			if (routed.category === "bash_failure") {
-				const command = typeof event.input.command === "string" ? event.input.command : "unknown";
-				const prompt = await buildBashFailurePrompt(command, textOf(event.content), "", cwd, signal);
+				const command = typeof ev.input.command === "string" ? ev.input.command : "unknown";
+				const prompt = await buildBashFailurePrompt(command, textOf(ev.content), "", cwd, signal);
 				const raw = await invokeCodex(prompt, cwd, routed.effort, routed.model, signal);
 				if (raw) {
 					const out = await compactOutput(raw, cwd);
@@ -1067,16 +1105,16 @@ export default function codexReflector(pi: ExtensionAPI): void {
 
 			if (routed.category === "code_change_failure") {
 				const filePath = pickString(
-					event.input,
+					ev.input,
 					["path", "file_path", "target_filepath"],
 					"unknown",
 				);
-				const codeEdit = typeof event.input.code_edit === "string" ? event.input.code_edit : "";
-				const instruction = pickString(event.input, ["instruction", "instructions"], "");
+				const codeEdit = typeof ev.input.code_edit === "string" ? ev.input.code_edit : "";
+				const instruction = pickString(ev.input, ["instruction", "instructions"], "");
 				const prompt = buildCodeChangeFailurePrompt(
-					event.toolName,
+					ev.toolName,
 					filePath,
-					textOf(event.content),
+					textOf(ev.content),
 					codeEdit,
 					instruction,
 				);
