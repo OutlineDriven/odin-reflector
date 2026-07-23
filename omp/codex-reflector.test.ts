@@ -327,15 +327,22 @@ describe("factory", () => {
 	});
 
 	test("session_stop settles (undefined) when there is nothing to review", async () => {
-		const { pi, handlers } = makePi();
-		codexReflector(pi);
-		const handler = handlers.get("session_stop");
-		expect(handler).toBeDefined();
-		const result = await handler?.(
-			{ type: "session_stop", messages: [], turn_id: 1, session_id: "s", stop_hook_active: false },
-			{ cwd: ".", ui: { notify() {} } },
-		);
-		expect(result).toBeUndefined();
+		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
+		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("session_stop");
+			expect(handler).toBeDefined();
+			const result = await handler?.(
+				{ type: "session_stop", messages: [], turn_id: 1, session_id: "s", stop_hook_active: false },
+				{ cwd: ".", ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+		} finally {
+			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
+		}
 	});
 	// Stop-review settle contract: a PASS/UNCERTAIN verdict must settle SILENTLY —
 	// return undefined AND inject no conversation message. Injecting it via pi.sendMessage

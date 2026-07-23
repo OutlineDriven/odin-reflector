@@ -138,7 +138,7 @@ omp --profile <profile> plugin install https://github.com/OutlineDriven/odin-ref
 
 Reads the same [environment variables](#environment-variables) as the Claude plugin. Run the unit tests with `bun test omp/codex-reflector.test.ts`.
 
-**Behavioral delta from the Claude plugin:** both ports are stateless. Code reviews inject their verdict and full opinion inline for every verdict; the Stop gate is a fresh holistic review on the native `session_stop` event (main-session-only, awaited before the turn settles). Only a definitive FAIL blocks; PASS and UNCERTAIN settle (fail-open — never block on uncertainty). It runs once per stop chain: a FAIL returns `{ decision: "block", reason }` so the agent keeps working with that context, then the harness `stop_hook_active` flag settles the re-stop (matching the Python plugin); the native 8-continuation cap is the backstop.
+**Behavioral delta from the Claude plugin:** both ports are stateless. Code reviews inject their verdict and full opinion inline for every verdict. On OMP, the pre-execution bash guard (`tool_call`) and holistic Stop gate (`session_stop`) are opt-in and disabled by default; they can be toggled via extension flags (`codex-bash-guard`, `codex-stop-review`) in `/settings` or enabled via env vars (`CODEX_REFLECTOR_BASH_GUARD=1`, `CODEX_REFLECTOR_STOP_REVIEW=1`). When active, the Stop gate performs a fresh holistic review on the native `session_stop` event: only a definitive FAIL blocks; PASS and UNCERTAIN settle (fail-open — never block on uncertainty). It runs once per stop chain: a FAIL returns `{ decision: "block", reason }` so the agent keeps working with that context, then the harness `stop_hook_active` flag settles the re-stop; the native 8-continuation cap is the backstop.
 
 ### Hook events
 
@@ -159,6 +159,8 @@ Both surfaces honor the same variables.
 | Variable | Default | Description |
 |---|---|---|
 | `CODEX_REFLECTOR_ENABLED` | `1` | Set to `0` to disable all hooks |
+| `CODEX_REFLECTOR_BASH_GUARD` | `0` (OMP) / `1` (Claude) | Set to `1` on OMP to enable opt-in pre-execution bash guard (`0` disables) |
+| `CODEX_REFLECTOR_STOP_REVIEW` | `0` (OMP) / `1` (Claude) | Set to `1` on OMP to enable opt-in holistic stop reflection gate (`0` disables) |
 | `CODEX_REFLECTOR_MODEL` | _(codex default)_ | Override model for `codex exec` |
 | `CODEX_REFLECTOR_DEBUG` | `0` | Set to `1` for stderr diagnostics |
 
