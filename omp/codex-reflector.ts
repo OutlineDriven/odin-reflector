@@ -30,7 +30,8 @@
  * Stop remains the only post-hoc blocking gate.
  *
  * Env vars: CODEX_REFLECTOR_ENABLED ("0" disables), CODEX_REFLECTOR_BASH_GUARD
- * ("0" disables only the bash pre-guard), CODEX_REFLECTOR_MODEL (override all
+ * ("1" enables opt-in bash pre-guard, "0" disables), CODEX_REFLECTOR_STOP_REVIEW
+ * ("1" enables opt-in stop review, "0" disables), CODEX_REFLECTOR_MODEL (override all
  * model selections), CODEX_REFLECTOR_DEBUG ("1" for logger diagnostics).
  */
 
@@ -1037,6 +1038,20 @@ const VERDICT_PREFIX: Record<Verdict, string> = {
 	UNCERTAIN: "? UNCERTAIN",
 };
 
+export function isBashGuardEnabled(pi: ExtensionAPI): boolean {
+	if (process.env.CODEX_REFLECTOR_BASH_GUARD === "1") return true;
+	if (process.env.CODEX_REFLECTOR_BASH_GUARD === "0") return false;
+	const flag = pi.getFlag("codex-bash-guard");
+	return flag === true || flag === "1" || flag === "true";
+}
+
+export function isStopReviewEnabled(pi: ExtensionAPI): boolean {
+	if (process.env.CODEX_REFLECTOR_STOP_REVIEW === "1") return true;
+	if (process.env.CODEX_REFLECTOR_STOP_REVIEW === "0") return false;
+	const flag = pi.getFlag("codex-stop-review");
+	return flag === true || flag === "1" || flag === "true";
+}
+
 // ---------------------------------------------------------------------------
 // Hook factory
 // ---------------------------------------------------------------------------
@@ -1044,6 +1059,18 @@ const VERDICT_PREFIX: Record<Verdict, string> = {
 export default function codexReflector(pi: ExtensionAPI): void {
 	if (process.env.CODEX_REFLECTOR_ENABLED === "0") return;
 	logger = pi.logger;
+	pi.registerFlag("codex-bash-guard", {
+		description: "Enable pre-execution bash safety guard (opt-in)",
+		type: "boolean",
+		default: false,
+	});
+
+	pi.registerFlag("codex-stop-review", {
+		description: "Enable holistic stop reflection gate (opt-in)",
+		type: "boolean",
+		default: false,
+	});
+
 
 	// Review code changes / diagnose failures on each tool result.
 	pi.on("tool_result", async (event, ctx) => {
@@ -1149,7 +1176,7 @@ export default function codexReflector(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		let deadline: ReturnType<typeof handlerDeadline> | undefined;
 		try {
-			if (process.env.CODEX_REFLECTOR_BASH_GUARD === "0") return undefined;
+			if (!isBashGuardEnabled(pi)) return undefined;
 			if (getProp(event, "toolName") !== "bash") return undefined;
 			const input = getProp(event, "input");
 			const command = getProp(input, "command");
@@ -1179,6 +1206,7 @@ export default function codexReflector(pi: ExtensionAPI): void {
 	pi.on("session_stop", async (event, ctx) => {
 		let deadline: ReturnType<typeof handlerDeadline> | undefined;
 		try {
+			if (!isStopReviewEnabled(pi)) return undefined;
 			if (getProp(event, "stop_hook_active") === true) return undefined;
 			// Claude-Code parity for aborted-tail settles (its Stop hook never fires on
 			// user interrupt). omp >=16.x suppresses these emissions itself; this keeps

@@ -230,10 +230,14 @@ describe("factory", () => {
 		events: string[];
 		handlers: Map<string, (event: unknown, ctx: unknown) => unknown>;
 		sendMessageCalls: unknown[];
+		flags: Map<string, { description?: string; type: "boolean" | "string"; default?: boolean | string }>;
+		flagValues: Map<string, boolean | string>;
 	} {
 		const events: string[] = [];
 		const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 		const sendMessageCalls: unknown[] = [];
+		const flags = new Map<string, { description?: string; type: "boolean" | "string"; default?: boolean | string }>();
+		const flagValues = new Map<string, boolean | string>();
 		const stub = {
 			on: (name: string, handler: unknown) => {
 				events.push(name);
@@ -241,12 +245,19 @@ describe("factory", () => {
 					handlers.set(name, handler as (event: unknown, ctx: unknown) => unknown);
 				}
 			},
+			registerFlag: (name: string, options: { description?: string; type: "boolean" | "string"; default?: boolean | string }) => {
+				flags.set(name, options);
+				if (options.default !== undefined) {
+					flagValues.set(name, options.default);
+				}
+			},
+			getFlag: (name: string) => flagValues.get(name),
 			sendMessage: (msg: unknown) => {
 				sendMessageCalls.push(msg);
 			},
 			logger: { debug() {}, info() {} },
 		};
-		return { pi: stub as unknown as ExtensionAPI, events, handlers, sendMessageCalls };
+		return { pi: stub as unknown as ExtensionAPI, events, handlers, sendMessageCalls, flags, flagValues };
 	}
 
 	test("registers the four lifecycle handlers", () => {
@@ -267,6 +278,51 @@ describe("factory", () => {
 		} finally {
 			if (prev === undefined) delete process.env.CODEX_REFLECTOR_ENABLED;
 			else process.env.CODEX_REFLECTOR_ENABLED = prev;
+		}
+	});
+	test("session_stop is disabled by default (opt-in)", async () => {
+		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
+		delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("session_stop");
+			expect(handler).toBeDefined();
+			const result = await handler?.(
+				{
+					type: "session_stop",
+					messages: [
+						{ role: "user", content: "hi" },
+						{ role: "assistant", content: "did work" },
+					],
+					turn_id: 1,
+					session_id: "s",
+					stop_hook_active: false,
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+		} finally {
+			if (prevStopReview !== undefined) process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
+		}
+	});
+
+	test("session_stop runs when codex-stop-review flag is enabled", async () => {
+		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
+		delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+		try {
+			const { pi, handlers, flagValues } = makePi();
+			codexReflector(pi);
+			flagValues.set("codex-stop-review", true);
+			const handler = handlers.get("session_stop");
+			expect(handler).toBeDefined();
+			const result = await handler?.(
+				{ type: "session_stop", messages: [], turn_id: 1, session_id: "s", stop_hook_active: false },
+				{ cwd: ".", ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+		} finally {
+			if (prevStopReview !== undefined) process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
 		}
 	});
 
@@ -302,7 +358,9 @@ describe("factory", () => {
 			);
 			chmodSync(join(binDir, "codex"), 0o755);
 			const prevPath = process.env.PATH ?? "";
+			const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
 			process.env.PATH = `${binDir}:${prevPath}`;
+			process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
 			try {
 				const { pi, handlers, sendMessageCalls } = makePi();
 				codexReflector(pi);
@@ -330,6 +388,8 @@ describe("factory", () => {
 				expect(sendMessageCalls).toHaveLength(0);
 			} finally {
 				process.env.PATH = prevPath;
+				if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+				else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
 				rmSync(binDir, { recursive: true, force: true });
 			}
 		}, 15_000);
@@ -357,8 +417,10 @@ exit 0
 		chmodSync(join(binDir, "codex"), 0o755);
 		const prevPath = process.env.PATH ?? "";
 		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
+		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
 		process.env.PATH = `${binDir}:${prevPath}`;
 		delete process.env.CODEX_REFLECTOR_MODEL;
+		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
@@ -386,6 +448,8 @@ exit 0
 			process.env.PATH = prevPath;
 			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
 			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
+			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
 			rmSync(binDir, { recursive: true, force: true });
 		}
 	}, 15_000);
@@ -462,7 +526,9 @@ exit 0
 		);
 		chmodSync(join(binDir, "codex"), 0o755);
 		const prevPath = process.env.PATH ?? "";
+		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
 		process.env.PATH = `${binDir}:${prevPath}`;
+		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
 		try {
 			const { pi, handlers, sendMessageCalls } = makePi();
 			codexReflector(pi);
@@ -486,6 +552,8 @@ exit 0
 			expect(sendMessageCalls).toHaveLength(0);
 		} finally {
 			process.env.PATH = prevPath;
+			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
 			rmSync(binDir, { recursive: true, force: true });
 		}
 	}, 15_000);
@@ -498,7 +566,9 @@ exit 0
 		writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 0\n`);
 		chmodSync(join(binDir, "codex"), 0o755);
 		const prevPath = process.env.PATH ?? "";
+		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
 		process.env.PATH = `${binDir}:${prevPath}`;
+		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
 		try {
 			const { pi, handlers, sendMessageCalls } = makePi();
 			codexReflector(pi);
@@ -523,6 +593,8 @@ exit 0
 			expect(sendMessageCalls).toHaveLength(0);
 		} finally {
 			process.env.PATH = prevPath;
+			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
 			rmSync(binDir, { recursive: true, force: true });
 		}
 	}, 15_000);
@@ -533,7 +605,9 @@ exit 0
 		writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 0\n`);
 		chmodSync(join(binDir, "codex"), 0o755);
 		const prevPath = process.env.PATH ?? "";
+		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
 		process.env.PATH = `${binDir}:${prevPath}`;
+		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
 		try {
 			const { pi, handlers, sendMessageCalls } = makePi();
 			codexReflector(pi);
@@ -557,6 +631,8 @@ exit 0
 			expect(sendMessageCalls).toHaveLength(0);
 		} finally {
 			process.env.PATH = prevPath;
+			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
 			rmSync(binDir, { recursive: true, force: true });
 		}
 	}, 15_000);
@@ -799,7 +875,7 @@ exit 0
 			const prevPath = process.env.PATH ?? "";
 			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
 			process.env.PATH = `${binDir}:${prevPath}`;
-			delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+			process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
 			try {
 				const { pi, handlers } = makePi();
 				codexReflector(pi);
@@ -876,7 +952,7 @@ exit 0
 		const prevPath = process.env.PATH ?? "";
 		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
 		process.env.PATH = `${binDir}:${prevPath}`;
-		delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+		process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
@@ -899,6 +975,41 @@ exit 0
 		}
 	});
 
+	test("tool_call bash guard is disabled by default (opt-in)", async () => {
+		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
+		const invokeLog = join(binDir, "invoked.log");
+		writeFileSync(
+			join(binDir, "codex"),
+			`#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 0\n`,
+		);
+		chmodSync(join(binDir, "codex"), 0o755);
+		const prevPath = process.env.PATH ?? "";
+		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
+		process.env.PATH = `${binDir}:${prevPath}`;
+		delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const handler = handlers.get("tool_call");
+			expect(handler).toBeDefined();
+			const result = await handler?.(
+				{
+					type: "tool_call",
+					toolName: "bash",
+					toolCallId: "id",
+					input: { command: "rm -rf /" },
+				},
+				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+			);
+			expect(result).toBeUndefined();
+			expect(existsSync(invokeLog)).toBe(false);
+		} finally {
+			process.env.PATH = prevPath;
+			if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+			else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
+			rmSync(binDir, { recursive: true, force: true });
+		}
+	});
 	test("bash pre-guard invokes luna at low effort", async () => {
 		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
 		const argsLog = join(binDir, "args.log");
@@ -923,7 +1034,7 @@ exit 0
 		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
 		process.env.PATH = `${binDir}:${prevPath}`;
 		delete process.env.CODEX_REFLECTOR_MODEL;
-		delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+		process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
@@ -1085,8 +1196,13 @@ exit 0
 			chmodSync(join(binDir, "codex"), 0o755);
 			const prevPath = process.env.PATH ?? "";
 			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
+			const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
 			process.env.PATH = `${binDir}:${prevPath}`;
-			delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+			if (route.handler === "tool_call") {
+				process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
+			} else if (route.handler === "session_stop") {
+				process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
+			}
 			testSetHandlerBudgetMs(300); // > spawn+log time, << the 5s assert / 25s guard
 			try {
 				const { pi, handlers } = makePi();
@@ -1110,6 +1226,8 @@ exit 0
 				process.env.PATH = prevPath;
 				if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
 				else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
+				if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+				else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
 				testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
 				rmSync(binDir, { recursive: true, force: true });
 			}
@@ -1164,8 +1282,13 @@ exit 0
 			chmodSync(join(binDir, "codex"), 0o755);
 			const prevPath = process.env.PATH ?? "";
 			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
+			const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
 			process.env.PATH = `${binDir}:${prevPath}`;
-			delete process.env.CODEX_REFLECTOR_BASH_GUARD;
+			if (route.handler === "tool_call") {
+				process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
+			} else if (route.handler === "session_stop") {
+				process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
+			}
 			testSetHandlerBudgetMs(300); // > redact+spawn of the large input, << the 5s assert / 25s guard
 			try {
 				const { pi, handlers } = makePi();
@@ -1189,6 +1312,8 @@ exit 0
 				process.env.PATH = prevPath;
 				if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
 				else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
+				if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+				else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
 				testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
 				rmSync(binDir, { recursive: true, force: true });
 			}
