@@ -114,6 +114,7 @@ function getProp(obj: unknown, key: string): unknown {
 		: undefined;
 }
 
+
 function toArray(value: unknown): unknown[] {
 	return Array.isArray(value) ? value : [];
 }
@@ -318,32 +319,67 @@ function isFastApplyTool(toolName: string): boolean {
 const URI_SCHEME_RE = /^([a-z][a-z0-9+.-]*):\/\//i;
 
 /**
- * oh-my-pi invokes xd:// device tools (Morph fast_edit/fastcompact, ast_grep,
- * lsp, browser, …) as a `write` whose path is `xd://<device>` and whose content
- * is the device's JSON args. Resolve such a write to the event the classifier
- * should actually see:
- *   - non-`write` event, or plain file path → returned unchanged
- *   - failed scheme write, or a successful non-`xd` scheme (local://, memory://,
- *     artifact://, …) → null (no workspace file to review)
- *   - successful `xd://<device>` write → unwrapped to { toolName: device,
- *     input: <parsed args> } so classify() routes it by the real tool
- *     (fast_edit/ast_edit → code_change; fastcompact/ast_grep/… → null)
+ * Mounted `xd://` tools execute through the outer `write` transport. The
+ * completed result carries the canonical inner dispatch in `details.xdev`;
+ * retain its tool name, validated arguments, and result details so every
+ * existing route sees the same shape as a direct tool call.
+ *
+ * A missing dispatch is a legacy or plain write. The URL fallback only exists
+ * for older hosts that do not attach `details.xdev`.
  */
-export function resolveDeviceWrite(event: ToolResultEvent): ToolResultEvent | null {
+interface ReviewEvent {
+	toolName: string;
+	input: Record<string, unknown>;
+	content: ToolResultEvent["content"];
+	isError: boolean;
+	details?: unknown;
+}
+
+function isXdevDispatch(value: unknown): value is {
+	tool: string;
+	mode: "help" | "execute";
+	args?: Record<string, unknown>;
+	inner?: unknown;
+} {
+	const tool = getProp(value, "tool");
+	const mode = getProp(value, "mode");
+	const args = getProp(value, "args");
+	return (
+		typeof tool === "string" &&
+		tool.length > 0 &&
+		(mode === "help" || mode === "execute") &&
+		(args === undefined || (args !== null && typeof args === "object" && !Array.isArray(args)))
+	);
+}
+
+export function resolveDeviceWrite(event: ToolResultEvent): ReviewEvent | null {
 	if (event.toolName !== "write") return event;
+
+	const xdev = getProp(event.details, "xdev");
+	if (xdev !== undefined) {
+		if (!isXdevDispatch(xdev) || xdev.mode !== "execute") return null;
+		return {
+			...event,
+			toolName: xdev.tool,
+			input: xdev.args ?? {},
+			details: xdev.inner,
+		};
+	}
+
 	const path = typeof event.input.path === "string" ? event.input.path : "";
 	const scheme = path.match(URI_SCHEME_RE)?.[1];
-	if (!scheme) return event; // plain workspace path — unchanged
-	if (event.isError || scheme !== "xd") return null; // failed, or non-file target — skip
+	if (!scheme) return event;
+	if (event.isError || scheme !== "xd") return null;
 	const device = path.slice("xd://".length);
 	let input: Record<string, unknown> = {};
 	const rawArgs = event.input.content;
 	if (typeof rawArgs === "string") {
 		try {
-			const parsed = JSON.parse(rawArgs);
-			if (parsed && typeof parsed === "object") input = parsed as Record<string, unknown>;
+			const parsed: unknown = JSON.parse(rawArgs);
+			if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed))
+				input = parsed as Record<string, unknown>;
 		} catch {
-			/* unparseable args: leave input empty; classify routes by device name */
+			/* legacy unparseable args: retain the tool name and empty arguments */
 		}
 	}
 	return { ...event, toolName: device, input };
@@ -887,7 +923,7 @@ function extractPrepMessages(event: unknown): unknown[] {
 }
 
 /** Resolve the review target (display path, state keys, raw snippet) from a code-change result. Sync, pure. */
-export function resolveChangeTarget(event: ToolResultEvent): {
+export function resolveChangeTarget(event: ReviewEvent): {
 	filePath: string;
 	filePaths: string[];
 	rawSnippet: string;
@@ -1078,7 +1114,7 @@ export default function codexReflector(pi: ExtensionAPI): void {
 		try {
 			const ev = resolveDeviceWrite(event);
 			if (!ev) return undefined;
-			const routed = classify(ev.toolName, ev.isError ?? false, ev.input);
+			const routed = classify(ev.toolName, ev.isError, ev.input);
 			if (!routed) return undefined;
 			const cwd = ctx.cwd || process.cwd();
 			deadline = handlerDeadline();

@@ -838,13 +838,18 @@ exit 0
 					type: "tool_result",
 					toolName: "write",
 					toolCallId: "id",
-					input: {
-						path: "xd://fast_edit",
-						content: JSON.stringify({
-							target_filepath: "src/a.ts",
-							instructions: "add guard",
-							code_edit: "// marker\nif (!x) return;",
-						}),
+					input: { path: "xd://fast_edit", content: "outer result is not JSON" },
+					details: {
+						xdev: {
+							tool: "fast_edit",
+							mode: "execute",
+							args: {
+								target_filepath: "src/a.ts",
+								instructions: "add guard",
+								code_edit: "// marker\nif (!x) return;",
+							},
+							inner: { applied: true },
+						},
 					},
 					content: [{ type: "text", text: "Applied edit to src/a.ts" }],
 					isError: false,
@@ -1393,15 +1398,18 @@ describe("renderTranscript", () => {
 });
 
 describe("resolveChangeTarget", () => {
-	function evt(toolName: string, input: Record<string, unknown>, details?: unknown): ToolResultEvent {
+	function evt(
+		toolName: string,
+		input: Record<string, unknown>,
+		details?: unknown,
+	): Parameters<typeof resolveChangeTarget>[0] {
 		return {
-			type: "tool_result",
 			toolName,
-			toolCallId: "id",
 			input,
 			content: [],
+			isError: false,
 			details,
-		} as unknown as ToolResultEvent;
+		};
 	}
 
 	test("write -> input.path + input.content", () => {
@@ -1457,9 +1465,12 @@ describe("resolveChangeTarget", () => {
 });
 
 describe("resolveDeviceWrite", () => {
-	// Test fixture: minimal tool_result event. Single assertion to the domain
-	// type (no double-cast) — the reflector only reads toolName/input/isError.
-	function evt(toolName: string, input: Record<string, unknown>, isError = false): ToolResultEvent {
+	function evt(
+		toolName: string,
+		input: Record<string, unknown>,
+		isError = false,
+		details?: unknown,
+	): ToolResultEvent {
 		return {
 			type: "tool_result",
 			toolName,
@@ -1467,7 +1478,8 @@ describe("resolveDeviceWrite", () => {
 			input,
 			content: [],
 			isError,
-		} as ToolResultEvent;
+			details,
+		};
 	}
 
 	test("plain workspace path passes through unchanged", () => {
@@ -1489,6 +1501,85 @@ describe("resolveDeviceWrite", () => {
 		);
 		expect(r?.toolName).toBe("fast_edit");
 		expect(r?.input.target_filepath).toBe("src/a.ts");
+	});
+
+	test("details.xdev unwraps validated args and inner details", () => {
+		const r = resolveDeviceWrite(
+			evt(
+				"write",
+				{ path: "xd://edit", content: "ignored" },
+				false,
+				{
+					xdev: {
+						tool: "edit",
+						mode: "execute",
+						args: { input: "[ignored.ts#AAAA]\n..." },
+						inner: { path: "src/a.ts", diff: "@@ -1 +1 @@" },
+					},
+				},
+			),
+		);
+		expect(r).not.toBeNull();
+		if (!r) return;
+		expect(r.toolName).toBe("edit");
+		expect(r.input).toEqual({ input: "[ignored.ts#AAAA]\n..." });
+		expect(resolveChangeTarget(r)).toMatchObject({
+			filePath: "src/a.ts",
+			rawSnippet: "@@ -1 +1 @@",
+		});
+	});
+
+
+	test("details.xdev help reads are not tool executions", () => {
+		expect(
+			resolveDeviceWrite(
+				evt("write", { path: "xd://fast_edit", content: "{}" }, false, {
+					xdev: { tool: "fast_edit", mode: "help" },
+				}),
+			),
+		).toBeNull();
+	});
+
+	test("malformed details.xdev cannot fall back to outer JSON", () => {
+		expect(
+			resolveDeviceWrite(
+				evt("write", { path: "xd://fast_edit", content: '{"code_edit":"x"}' }, false, {
+					xdev: { tool: "fast_edit", mode: "execute", args: [] },
+				}),
+			),
+		).toBeNull();
+	});
+
+	test("details.xdev preserves every existing route and skips unrelated devices", () => {
+		const cases = [
+			{
+				tool: "ast_edit",
+				input: { paths: ["src/a.ts"], ops: [] },
+				isError: false,
+				category: "code_change",
+			},
+			{
+				tool: "mcp__sequential__sequentialthinking",
+				input: { thought: "check boundary" },
+				isError: false,
+				category: "thinking",
+			},
+			{ tool: "bash", input: { command: "false" }, isError: true, category: "bash_failure" },
+			{ tool: "fastcompact", input: { location: "README.md" }, isError: false, category: null },
+			{ tool: "resolve", input: {}, isError: false, category: null },
+			{ tool: "reject", input: {}, isError: false, category: null },
+			{ tool: "propose", input: {}, isError: false, category: null },
+		] as const;
+
+		for (const { tool, input, isError, category } of cases) {
+			const r = resolveDeviceWrite(
+				evt("write", { path: `xd://${tool}`, content: "not json" }, isError, {
+					xdev: { tool, mode: "execute", args: input, inner: {} },
+				}),
+			);
+			expect(r).not.toBeNull();
+			if (r) expect(classify(r.toolName, r.isError, r.input)?.category ?? null).toBe(category);
+		}
 	});
 
 	test("xd://fastcompact unwraps but classify() still skips it", () => {
