@@ -175,29 +175,29 @@ describe("changeSizeHeuristics", () => {
 });
 
 describe("gateModelEffort", () => {
-	test("tiny non-risky snippet -> low", () => {
+	test("tiny non-risky snippet -> medium", () => {
 		expect(gateModelEffort("code_change", "src/util.ts", "const x = 1;")).toEqual({
 			model: "gpt-5.6-luna",
-			effort: "low",
+			effort: "medium",
 		});
 	});
-	test("security-sensitive path -> hard (high)", () => {
+	test("security-sensitive path -> hard (medium)", () => {
 		expect(gateModelEffort("code_change", ".env.local", "X".repeat(300))).toEqual({
 			model: "gpt-5.6-sol",
-			effort: "high",
+			effort: "medium",
 		});
 	});
-	test("large snippet -> hard (high)", () => {
+	test("large snippet -> hard (medium)", () => {
 		expect(gateModelEffort("code_change", "src/util.ts", "X".repeat(6000))).toEqual({
 			model: "gpt-5.6-sol",
-			effort: "high",
+			effort: "medium",
 		});
 	});
-	test("multiple risk signals -> complex (xhigh)", () => {
+	test("multiple risk signals -> complex (high)", () => {
 		// security-sensitive path (1 file hint) + >5000 chars (1 change hint) -> complex
 		expect(gateModelEffort("code_change", ".env.local", "X".repeat(6000))).toEqual({
 			model: "gpt-5.6-sol",
-			effort: "xhigh",
+			effort: "high",
 		});
 	});
 	test("non code_change category -> base preset", () => {
@@ -738,7 +738,7 @@ exit 0
 			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
 			expect(argsLines).toHaveLength(1);
 			expect(argsLines[0]).toContain("-m gpt-5.3-codex-spark");
-			expect(argsLines[0]).toContain("model_reasoning_effort=low");
+			expect(argsLines[0]).toContain("model_reasoning_effort=medium");
 		} finally {
 			process.env.PATH = prevPath;
 			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
