@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import codexReflector, {
 	changeSizeHeuristics,
 	classify,
 	codeReviewResponse,
+	codexExecArgs,
 	fileHeuristics,
 	gateModelEffort,
 	handlerDeadline,
@@ -229,6 +231,32 @@ describe("ROUTED_MODELS", () => {
 	// exists to catch, and both sides would dedupe together and pass.
 	test("all three reviewer roles stay reachable through a preset", () => {
 		expect(new Set(ROUTED_MODELS).size).toBe(3);
+	});
+});
+
+describe("codexExecArgs", () => {
+	const args = codexExecArgs("medium", "gpt-5.6-sol", "/tmp/out.txt");
+
+	test("keeps the read-only sandbox guarantee", () => {
+		// AGENTS.md: "--sandbox read-only (not --full-auto) is the read-only
+		// guarantee", and --skip-git-repo-check "prevents a silent fail-open
+		// outside a git repo".
+		expect(args).toContain("--sandbox");
+		expect(args[args.indexOf("--sandbox") + 1]).toBe("read-only");
+		expect(args).toContain("--skip-git-repo-check");
+		expect(args).not.toContain("--full-auto");
+	});
+
+	test("every long flag is accepted by the installed codex exec", () => {
+		// The suite stubs `codex` with a fake that ignores argv, so an argv the
+		// real CLI rejects passes every other test here while failing open in
+		// production. `codex exec --help` is local and needs no auth, so ask the
+		// real parser what it accepts. Skips when codex is not installed.
+		const help = spawnSync("codex", ["exec", "--help"], { encoding: "utf8" });
+		if (help.error || help.status !== 0) return; // codex unavailable — nothing to check
+		for (const flag of args.filter((a) => a.startsWith("--"))) {
+			expect(help.stdout).toContain(flag);
+		}
 	});
 });
 

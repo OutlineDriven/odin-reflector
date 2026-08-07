@@ -463,6 +463,29 @@ export function gateModelEffort(category: Category, filePath: string, snippet: s
 // Codex invocation + matryoshka compaction
 // ---------------------------------------------------------------------------
 
+/** The `codex exec` argv. Exported so a test can check every long flag against
+ *  the installed `codex exec --help`: the suite stubs `codex` with a fake that
+ *  ignores argv, so a flag the real CLI rejects would otherwise pass every test
+ *  while failing open in production — which is how `--full-auto` survived here.
+ *  `--sandbox read-only` is the read-only guarantee; keep it identical to the
+ *  Python surface's flag set. */
+export function codexExecArgs(effort: Effort, model: string, outPath: string): string[] {
+	return [
+		"exec",
+		"--sandbox",
+		"read-only",
+		"--skip-git-repo-check",
+		"--ephemeral",
+		"-c",
+		`model_reasoning_effort=${effort}`,
+		"-m",
+		model,
+		"-o",
+		outPath,
+		"-", // read prompt from stdin
+	];
+}
+
 /** Call `codex exec` in a read-only sandbox; fail-open to "" on any error. */
 async function invokeCodex(
 	prompt: string,
@@ -477,21 +500,7 @@ async function invokeCodex(
 	const outPath = join(tmpdir(), `codex-ref-${randomUUID()}.txt`);
 	try {
 		const ok = await new Promise<boolean>((resolve) => {
-			const args = [
-				"exec",
-				"--sandbox",
-				"read-only",
-				"--skip-git-repo-check",
-				"--full-auto",
-				"--ephemeral",
-				"-c",
-				`model_reasoning_effort=${effort}`,
-				"-m",
-				m,
-				"-o",
-				outPath,
-				"-", // read prompt from stdin
-			];
+			const args = codexExecArgs(effort, m, outPath);
 			debug(`invoking codex (effort=${effort}, model=${m})`);
 			const child = spawn("codex", args, {
 				cwd: cwd || undefined,
