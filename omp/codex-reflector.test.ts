@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import codexReflector, {
 	changeSizeHeuristics,
 	classify,
 	codeReviewResponse,
+	codexExecArgs,
 	fileHeuristics,
 	gateModelEffort,
 	handlerDeadline,
@@ -22,6 +24,7 @@ import codexReflector, {
 	renderTranscript,
 	resolveChangeTarget,
 	resolveDeviceWrite,
+	ROUTED_MODELS,
 	sandboxContent,
 	stopReviewDecision,
 	testSetHandlerBudgetMs,
@@ -211,6 +214,49 @@ describe("gateModelEffort", () => {
 			model: "gpt-5.6-luna",
 			effort: "high",
 		});
+	});
+});
+
+describe("ROUTED_MODELS", () => {
+	// AGENTS.md: "Keep three reviewer roles on both surfaces (DEFAULT_MODEL,
+	// FRONTIER_MODEL, FAST_MODEL) ... do not collapse roles onto one model."
+	// The per-preset tests above each pin one preset's exact slug, so they own
+	// role IDENTITY but cannot catch a sweep that retiers every preset and
+	// updates its own expectation in the same edit. This owns role CARDINALITY.
+	//
+	// Cardinality, not literal slugs: AGENTS.md expects the three role constants
+	// to be re-pinned when OpenAI renames the lineup, and a slug list would fail
+	// that legitimate edit. Asserting against the role constants instead would be
+	// worse — aliasing FRONTIER_MODEL to DEFAULT_MODEL is the collapse this guard
+	// exists to catch, and both sides would dedupe together and pass.
+	test("all three reviewer roles stay reachable through a preset", () => {
+		expect(new Set(ROUTED_MODELS).size).toBe(3);
+	});
+});
+
+describe("codexExecArgs", () => {
+	const args = codexExecArgs("medium", "gpt-5.6-sol", "/tmp/out.txt");
+
+	test("keeps the read-only sandbox guarantee", () => {
+		// AGENTS.md: "--sandbox read-only (not --full-auto) is the read-only
+		// guarantee", and --skip-git-repo-check "prevents a silent fail-open
+		// outside a git repo".
+		expect(args).toContain("--sandbox");
+		expect(args[args.indexOf("--sandbox") + 1]).toBe("read-only");
+		expect(args).toContain("--skip-git-repo-check");
+		expect(args).not.toContain("--full-auto");
+	});
+
+	test("every long flag is accepted by the installed codex exec", () => {
+		// The suite stubs `codex` with a fake that ignores argv, so an argv the
+		// real CLI rejects passes every other test here while failing open in
+		// production. `codex exec --help` is local and needs no auth, so ask the
+		// real parser what it accepts. Skips when codex is not installed.
+		const help = spawnSync("codex", ["exec", "--help"], { encoding: "utf8" });
+		if (help.error || help.status !== 0) return; // codex unavailable — nothing to check
+		for (const flag of args.filter((a) => a.startsWith("--"))) {
+			expect(help.stdout).toContain(flag);
+		}
 	});
 });
 
