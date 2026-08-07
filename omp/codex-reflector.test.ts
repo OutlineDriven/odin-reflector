@@ -22,6 +22,7 @@ import codexReflector, {
 	renderTranscript,
 	resolveChangeTarget,
 	resolveDeviceWrite,
+	ROUTED_MODELS,
 	sandboxContent,
 	stopReviewDecision,
 	testSetHandlerBudgetMs,
@@ -211,6 +212,23 @@ describe("gateModelEffort", () => {
 			model: "gpt-5.6-luna",
 			effort: "high",
 		});
+	});
+});
+
+describe("ROUTED_MODELS", () => {
+	// AGENTS.md: "Keep three reviewer roles on both surfaces (DEFAULT_MODEL,
+	// FRONTIER_MODEL, FAST_MODEL) ... do not collapse roles onto one model."
+	// The per-preset tests above each pin one preset's exact slug, so they own
+	// role IDENTITY but cannot catch a sweep that retiers every preset and
+	// updates its own expectation in the same edit. This owns role CARDINALITY.
+	//
+	// Cardinality, not literal slugs: AGENTS.md expects the three role constants
+	// to be re-pinned when OpenAI renames the lineup, and a slug list would fail
+	// that legitimate edit. Asserting against the role constants instead would be
+	// worse — aliasing FRONTIER_MODEL to DEFAULT_MODEL is the collapse this guard
+	// exists to catch, and both sides would dedupe together and pass.
+	test("all three reviewer roles stay reachable through a preset", () => {
+		expect(new Set(ROUTED_MODELS).size).toBe(3);
 	});
 });
 

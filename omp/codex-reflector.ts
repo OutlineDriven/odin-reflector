@@ -83,16 +83,34 @@ export interface Routed {
 }
 
 // Model/effort presets — every (model, effort) pair lives here.
-const CODE_REVIEW: Preset = { model: FAST_MODEL, effort: "high" };
-const CODE_REVIEW_HARD: Preset = { model: DEFAULT_MODEL, effort: "medium" };
-const CODE_REVIEW_COMPLEX: Preset = { model: DEFAULT_MODEL, effort: "high" };
+const CODE_REVIEW: Preset = { model: DEFAULT_MODEL, effort: "medium" };
+const CODE_REVIEW_HARD: Preset = { model: FRONTIER_MODEL, effort: "medium" };
+const CODE_REVIEW_COMPLEX: Preset = { model: FRONTIER_MODEL, effort: "high" };
 const CODE_REVIEW_TINY: Preset = { model: FAST_MODEL, effort: "medium" };
 const THINKING: Preset = { model: DEFAULT_MODEL, effort: "high" };
-const BASH_FAILURE: Preset = { model: FAST_MODEL, effort: "high" };
-const BASH_GUARD: Preset = { model: FAST_MODEL, effort: "medium" }; // pre-execution gate: luna@medium
-const STOP_REVIEW: Preset = { model: DEFAULT_MODEL, effort: "medium" };
-const PRECOMPACT: Preset = { model: DEFAULT_MODEL, effort: "low" };
+const BASH_FAILURE: Preset = { model: DEFAULT_MODEL, effort: "medium" };
+const BASH_GUARD: Preset = { model: FAST_MODEL, effort: "low" }; // pre-execution gate: luna@low
+const STOP_REVIEW: Preset = { model: FRONTIER_MODEL, effort: "medium" };
+const PRECOMPACT: Preset = { model: FRONTIER_MODEL, effort: "low" };
 const SUMMARIZE: Preset = { model: FAST_MODEL, effort: "high" };
+
+/** Every model slug reachable through a preset, derived from the presets above.
+ *  AGENTS.md forbids collapsing the three reviewer roles onto one model; a
+ *  per-preset test only catches that one preset at a time, so this array is
+ *  asserted as a three-way partition. It is derived, not restated: retiering a
+ *  preset moves its entry here automatically. */
+export const ROUTED_MODELS: readonly string[] = [
+	CODE_REVIEW.model,
+	CODE_REVIEW_HARD.model,
+	CODE_REVIEW_COMPLEX.model,
+	CODE_REVIEW_TINY.model,
+	THINKING.model,
+	BASH_FAILURE.model,
+	BASH_GUARD.model,
+	STOP_REVIEW.model,
+	PRECOMPACT.model,
+	SUMMARIZE.model,
+];
 
 // Compact output directives — verdict vs non-verdict prompts.
 const COMPACT_VERDICT =
